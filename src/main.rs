@@ -64,6 +64,14 @@ struct Board {
     cache: Vec<u8>,  // In-memory cache of entire board for fast rendering (background only)
     drawing_layer: Vec<u8>,  // Transparent drawing layer on top of posters (RGBA)
     undo_stack: Vec<Vec<u8>>,  // Store up to 3 previous drawing layer states
+    has_drawings: bool,  // Track if drawing layer has any non-transparent pixels
+    // Viewport render cache
+    viewport_cache: Vec<u8>,  // Cached rendered viewport
+    cached_viewport_width: u32,
+    cached_viewport_height: u32,
+    cached_viewport_pos: Point,
+    cached_viewport_zoom: f32,
+    viewport_dirty: bool,
 }
 
 /// Camera/viewport for navigation
@@ -156,6 +164,13 @@ impl Board {
             cache,
             drawing_layer,
             undo_stack: Vec::new(),
+            has_drawings: false,  // Will be set to true when loading or drawing
+            viewport_cache: Vec::new(),
+            cached_viewport_width: 0,
+            cached_viewport_height: 0,
+            cached_viewport_pos: Point { x: 0.0, y: 0.0 },
+            cached_viewport_zoom: 1.0,
+            viewport_dirty: true,
         };
 
         if has_valid_header {
@@ -195,6 +210,9 @@ impl Board {
             let drawing_data = std::fs::read("drawing_layer.data")?;
             if drawing_data.len() == self.drawing_layer.len() {
                 self.drawing_layer.copy_from_slice(&drawing_data);
+                
+                // Check if there are any non-transparent pixels
+                self.has_drawings = self.drawing_layer.chunks(4).any(|pixel| pixel[3] != 0);
             }
         }
         
@@ -219,6 +237,11 @@ impl Board {
         unsafe {
             let ptr = self.drawing_layer.as_mut_ptr().add(offset) as *mut u32;
             *ptr = u32::from_ne_bytes(color);
+        }
+        
+        // Mark that we have drawings (if not erasing)
+        if color[3] != 0 {
+            self.has_drawings = true;
         }
     }
     
@@ -313,6 +336,9 @@ impl Board {
             self.drawing_layer[i] = 0;
         }
         
+        // Reset drawing flag
+        self.has_drawings = false;
+        
         // Write cache to disk in chunks
         let chunk_size = 1024 * 256; // 256KB chunks
         let total_bytes = self.cache.len();
@@ -342,8 +368,26 @@ impl Board {
 
     /// Render the current viewport with optional cylindrical projection
     /// Optimized with parallel processing for maximum CPU utilization
-    fn render(&mut self, screen_width: u32, screen_height: u32) -> io::Result<Vec<u8>> {
-        let mut framebuffer = vec![0u8; (screen_width * screen_height * 4) as usize];
+    fn render(&mut self, frame: &mut [u8], screen_width: u32, screen_height: u32) -> io::Result<()> {
+        // Check if we can reuse the cached viewport
+        let needs_rerender = self.viewport_dirty ||
+                            self.cached_viewport_width != screen_width ||
+                            self.cached_viewport_height != screen_height ||
+                            (self.viewport.position.x - self.cached_viewport_pos.x).abs() > 0.001 ||
+                            (self.viewport.position.y - self.cached_viewport_pos.y).abs() > 0.001 ||
+                            (self.viewport.zoom - self.cached_viewport_zoom).abs() > 0.001;
+        
+        if !needs_rerender && !self.viewport_cache.is_empty() {
+            // Use cached viewport
+            frame.copy_from_slice(&self.viewport_cache);
+            return Ok(());
+        }
+        
+        // Need to re-render
+        let buffer_size = (screen_width * screen_height * 4) as usize;
+        if self.viewport_cache.len() != buffer_size {
+            self.viewport_cache = vec![0u8; buffer_size];
+        }
         
         // Starting position for rendering
         let start_x = self.viewport.position.x as i32;
@@ -356,7 +400,7 @@ impl Board {
         let cache_ptr = &self.cache;
         
         // Parallel row rendering for maximum CPU utilization
-        framebuffer.par_chunks_mut((screen_width * 4) as usize)
+        self.viewport_cache.par_chunks_mut((screen_width * 4) as usize)
             .enumerate()
             .for_each(|(screen_y, row)| {
                 // Apply zoom: convert screen coords to board coords
@@ -381,43 +425,87 @@ impl Board {
                     }
                 }
             });
+        
+        // Update cache metadata
+        self.cached_viewport_width = screen_width;
+        self.cached_viewport_height = screen_height;
+        self.cached_viewport_pos = Point { x: self.viewport.position.x, y: self.viewport.position.y };
+        self.cached_viewport_zoom = self.viewport.zoom;
+        self.viewport_dirty = false;
+        
+        // Copy to output frame
+        frame.copy_from_slice(&self.viewport_cache);
 
-        Ok(framebuffer)
+        Ok(())
     }
     
     /// Render the drawing layer with alpha blending on top of the current frame
-    fn render_drawing_layer(&self, frame: &mut [u8], screen_width: u32, screen_height: u32) {
+    fn render_drawing_layer(&self, frame: &mut [u8], screen_width: u32, _screen_height: u32) {
+        // Early exit if no drawings at all
+        if !self.has_drawings {
+            return;
+        }
+        
+        use rayon::prelude::*;
+        
         let start_x = self.viewport.position.x as i32;
         let start_y = self.viewport.position.y as i32;
         let zoom = self.viewport.zoom;
         let width = self.config.width as i32;
         let height = self.config.height as i32;
         
-        for screen_y in 0..screen_height {
-            let board_y = start_y + ((screen_y as f32) / zoom) as i32;
-            
-            if board_y >= 0 && board_y < height {
+        // Use fixed-point arithmetic for zoom (16.16 fixed point)
+        let zoom_inv_fixed = ((1.0 / zoom) * 65536.0) as i32;
+        
+        // Parallel processing by rows
+        frame.par_chunks_mut((screen_width * 4) as usize)
+            .enumerate()
+            .for_each(|(screen_y, row)| {
+                let board_y = start_y + ((screen_y as i32 * zoom_inv_fixed) >> 16);
+                
+                if board_y < 0 || board_y >= height {
+                    return;
+                }
+                
                 let row_start_offset = (board_y as usize) * (width as usize) * 4;
                 
+                // Process pixels in this row
                 for screen_x in 0..screen_width {
-                    let board_x = start_x + ((screen_x as f32) / zoom) as i32;
+                    let board_x = start_x + ((screen_x as i32 * zoom_inv_fixed) >> 16);
                     let wrapped_x = board_x.rem_euclid(width) as usize;
                     let src_offset = row_start_offset + (wrapped_x * 4);
-                    let dst_offset = ((screen_y * screen_width + screen_x) * 4) as usize;
+                    let dst_offset = (screen_x * 4) as usize;
                     
-                    if src_offset + 3 < self.drawing_layer.len() && dst_offset + 3 < frame.len() {
-                        let alpha = self.drawing_layer[src_offset + 3] as f32 / 255.0;
-                        
-                        if alpha > 0.0 {
-                            let inv_alpha = 1.0 - alpha;
-                            frame[dst_offset] = ((self.drawing_layer[src_offset] as f32 * alpha) + (frame[dst_offset] as f32 * inv_alpha)) as u8;
-                            frame[dst_offset + 1] = ((self.drawing_layer[src_offset + 1] as f32 * alpha) + (frame[dst_offset + 1] as f32 * inv_alpha)) as u8;
-                            frame[dst_offset + 2] = ((self.drawing_layer[src_offset + 2] as f32 * alpha) + (frame[dst_offset + 2] as f32 * inv_alpha)) as u8;
+                    if src_offset + 3 >= self.drawing_layer.len() || dst_offset + 3 >= row.len() {
+                        continue;
+                    }
+                    
+                    let alpha = self.drawing_layer[src_offset + 3];
+                    
+                    // Skip fully transparent pixels
+                    if alpha == 0 {
+                        continue;
+                    }
+                    
+                    // Use integer alpha blending
+                    if alpha == 255 {
+                        // Fully opaque - direct copy
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                self.drawing_layer.as_ptr().add(src_offset),
+                                row.as_mut_ptr().add(dst_offset),
+                                3
+                            );
                         }
+                    } else {
+                        // Partial transparency - integer blend
+                        let inv_alpha = 255 - alpha;
+                        row[dst_offset] = ((self.drawing_layer[src_offset] as u16 * alpha as u16 + row[dst_offset] as u16 * inv_alpha as u16) / 255) as u8;
+                        row[dst_offset + 1] = ((self.drawing_layer[src_offset + 1] as u16 * alpha as u16 + row[dst_offset + 1] as u16 * inv_alpha as u16) / 255) as u8;
+                        row[dst_offset + 2] = ((self.drawing_layer[src_offset + 2] as u16 * alpha as u16 + row[dst_offset + 2] as u16 * inv_alpha as u16) / 255) as u8;
                     }
                 }
-            }
-        }
+            });
     }
 }
 
@@ -900,36 +988,79 @@ impl RickBoard {
             let screen_y = ((poster.position.y - self.board.viewport.position.y) * zoom) as i32;
             
             // Calculate scaled poster dimensions (applying both poster scale and viewport zoom)
-            let scaled_width = (poster.width as f32 * poster.scale * zoom) as u32;
-            let scaled_height = (poster.height as f32 * poster.scale * zoom) as u32;
+            let scaled_width = (poster.width as f32 * poster.scale * zoom) as i32;
+            let scaled_height = (poster.height as f32 * poster.scale * zoom) as i32;
             
-            // Render poster pixels with scaling
-            for sy in 0..scaled_height as i32 {
-                for sx in 0..scaled_width as i32 {
-                    let screen_px = screen_x + sx;
-                    let screen_py = screen_y + sy;
+            // Early exit: skip if poster is completely off-screen
+            if screen_x + scaled_width < 0 || screen_x >= width as i32 ||
+               screen_y + scaled_height < 0 || screen_y >= height as i32 {
+                continue;
+            }
+            
+            // Calculate visible bounds to avoid iterating off-screen pixels
+            let start_sx = 0.max(-screen_x);
+            let start_sy = 0.max(-screen_y);
+            let end_sx = scaled_width.min(width as i32 - screen_x);
+            let end_sy = scaled_height.min(height as i32 - screen_y);
+            
+            // Use fixed-point arithmetic for faster scaling (16.16 fixed point)
+            let scale_factor_inv = ((1.0 / (poster.scale * zoom)) * 65536.0) as i32;
+            
+            // Render poster pixels with scaling (only visible portion)
+            for sy in start_sy..end_sy {
+                let screen_py = screen_y + sy;
+                let poster_py = ((sy * scale_factor_inv) >> 16) as u32;
+                
+                if poster_py >= poster.height {
+                    continue;
+                }
+                
+                let poster_row_base = (poster_py * poster.width * 4) as usize;
+                let screen_row_base = (screen_py * width as i32) as usize * 4;
+                
+                for sx in start_sx..end_sx {
+                    let poster_px = ((sx * scale_factor_inv) >> 16) as u32;
                     
-                    // Check if pixel is within screen bounds
-                    if screen_px >= 0 && screen_px < width as i32 && screen_py >= 0 && screen_py < height as i32 {
-                        // Map screen pixel back to poster pixel (inverse of both scales)
-                        let poster_px = (sx as f32 / (poster.scale * zoom)) as u32;
-                        let poster_py = (sy as f32 / (poster.scale * zoom)) as u32;
-                        
-                        if poster_px < poster.width && poster_py < poster.height {
-                            let poster_offset = ((poster_py * poster.width + poster_px) * 4) as usize;
-                            let screen_offset = ((screen_py * width as i32 + screen_px) * 4) as usize;
-                            
-                            if poster_offset + 3 < poster.image_data.len() && screen_offset + 3 < frame.len() {
-                                // Alpha blend the poster with the background
-                                let alpha = poster.image_data[poster_offset + 3] as f32 / 255.0;
-                                let inv_alpha = 1.0 - alpha;
-                                
-                                frame[screen_offset] = ((poster.image_data[poster_offset] as f32 * alpha) + (frame[screen_offset] as f32 * inv_alpha)) as u8;
-                                frame[screen_offset + 1] = ((poster.image_data[poster_offset + 1] as f32 * alpha) + (frame[screen_offset + 1] as f32 * inv_alpha)) as u8;
-                                frame[screen_offset + 2] = ((poster.image_data[poster_offset + 2] as f32 * alpha) + (frame[screen_offset + 2] as f32 * inv_alpha)) as u8;
-                                frame[screen_offset + 3] = 255;
-                            }
+                    if poster_px >= poster.width {
+                        continue;
+                    }
+                    
+                    let poster_offset = poster_row_base + (poster_px * 4) as usize;
+                    
+                    // Skip if out of bounds or fully transparent
+                    if poster_offset + 3 >= poster.image_data.len() {
+                        continue;
+                    }
+                    
+                    let alpha = poster.image_data[poster_offset + 3];
+                    if alpha == 0 {
+                        continue;
+                    }
+                    
+                    let screen_offset = screen_row_base + ((screen_x + sx) * 4) as usize;
+                    if screen_offset + 3 >= frame.len() {
+                        continue;
+                    }
+                    
+                    // Alpha blend the poster with the background
+                    if alpha == 255 {
+                        // Fully opaque - direct copy (most common case)
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                poster.image_data.as_ptr().add(poster_offset),
+                                frame.as_mut_ptr().add(screen_offset),
+                                3
+                            );
                         }
+                        frame[screen_offset + 3] = 255;
+                    } else {
+                        // Partial transparency - blend (using integer math)
+                        let inv_alpha = 255 - alpha;
+                        
+                        frame[screen_offset] = ((poster.image_data[poster_offset] as u16 * alpha as u16 + frame[screen_offset] as u16 * inv_alpha as u16) / 255) as u8;
+                        frame[screen_offset + 1] = ((poster.image_data[poster_offset + 1] as u16 * alpha as u16 + frame[screen_offset + 1] as u16 * inv_alpha as u16) / 255) as u8;
+                        frame[screen_offset + 2] = ((poster.image_data[poster_offset + 2] as u16 * alpha as u16 + frame[screen_offset + 2] as u16 * inv_alpha as u16) / 255) as u8;
+                        frame[screen_offset + 3] = 255;
                     }
                 }
             }
@@ -953,18 +1084,21 @@ impl RickBoard {
         let y_offset = -(self.legend_offset as i32);
         
         // Draw background panel (top-left, from y:0 to y:280, 290 pixels wide)
+        let bg_alpha = bg_color[3];
+        let inv_bg_alpha = 255 - bg_alpha;
+        
         for y in 0..280 {
             let screen_y = y + y_offset;
             if screen_y < 0 || screen_y >= height as i32 { continue; }
+            let row_offset = (screen_y as u32 * width * 4) as usize;
+            
             for x in 10..290 {
-                let offset = ((screen_y as u32 * width + x) * 4) as usize;
+                let offset = row_offset + (x * 4) as usize;
                 if offset + 3 < frame.len() {
-                    // Alpha blend with existing content for transparency
-                    let alpha = bg_color[3] as f32 / 255.0;
-                    let inv_alpha = 1.0 - alpha;
-                    frame[offset] = ((bg_color[0] as f32 * alpha) + (frame[offset] as f32 * inv_alpha)) as u8;
-                    frame[offset + 1] = ((bg_color[1] as f32 * alpha) + (frame[offset + 1] as f32 * inv_alpha)) as u8;
-                    frame[offset + 2] = ((bg_color[2] as f32 * alpha) + (frame[offset + 2] as f32 * inv_alpha)) as u8;
+                    // Alpha blend with existing content using integer math
+                    frame[offset] = ((bg_color[0] as u16 * bg_alpha as u16 + frame[offset] as u16 * inv_bg_alpha as u16) / 255) as u8;
+                    frame[offset + 1] = ((bg_color[1] as u16 * bg_alpha as u16 + frame[offset + 1] as u16 * inv_bg_alpha as u16) / 255) as u8;
+                    frame[offset + 2] = ((bg_color[2] as u16 * bg_alpha as u16 + frame[offset + 2] as u16 * inv_bg_alpha as u16) / 255) as u8;
                     frame[offset + 3] = 255; // Keep fully opaque
                 }
             }
@@ -1138,15 +1272,16 @@ impl RickBoard {
         let panel_x = (width / 2).saturating_sub(panel_width / 2);
         let panel_y = (height / 2).saturating_sub(panel_height / 2);
         
+        let panel_alpha = bg_color[3];
+        let panel_inv_alpha = 255 - panel_alpha;
+        
         for y in panel_y..panel_y + panel_height {
             for x in panel_x..panel_x + panel_width {
                 let offset = ((y * width + x) * 4) as usize;
                 if offset + 3 < frame.len() {
-                    let alpha = bg_color[3] as f32 / 255.0;
-                    let inv_alpha = 1.0 - alpha;
-                    frame[offset] = ((bg_color[0] as f32 * alpha) + (frame[offset] as f32 * inv_alpha)) as u8;
-                    frame[offset + 1] = ((bg_color[1] as f32 * alpha) + (frame[offset + 1] as f32 * inv_alpha)) as u8;
-                    frame[offset + 2] = ((bg_color[2] as f32 * alpha) + (frame[offset + 2] as f32 * inv_alpha)) as u8;
+                    frame[offset] = ((bg_color[0] as u16 * panel_alpha as u16 + frame[offset] as u16 * panel_inv_alpha as u16) / 255) as u8;
+                    frame[offset + 1] = ((bg_color[1] as u16 * panel_alpha as u16 + frame[offset + 1] as u16 * panel_inv_alpha as u16) / 255) as u8;
+                    frame[offset + 2] = ((bg_color[2] as u16 * panel_alpha as u16 + frame[offset + 2] as u16 * panel_inv_alpha as u16) / 255) as u8;
                     frame[offset + 3] = 255;
                 }
             }
@@ -1234,16 +1369,17 @@ impl RickBoard {
             let msg_x = bar_x + (bar_width / 2) - (msg_width / 2);
             
             // Draw background panel for message
+            let msg_alpha = bg_color[3];
+            let msg_inv_alpha = 255 - msg_alpha;
+            
             for y in msg_y..msg_y + msg_height {
                 for x in msg_x..msg_x + msg_width {
                     let offset = ((y * width + x) * 4) as usize;
                     if offset + 3 < frame.len() {
-                        // Alpha blend with existing content for transparency
-                        let alpha = bg_color[3] as f32 / 255.0;
-                        let inv_alpha = 1.0 - alpha;
-                        frame[offset] = ((bg_color[0] as f32 * alpha) + (frame[offset] as f32 * inv_alpha)) as u8;
-                        frame[offset + 1] = ((bg_color[1] as f32 * alpha) + (frame[offset + 1] as f32 * inv_alpha)) as u8;
-                        frame[offset + 2] = ((bg_color[2] as f32 * alpha) + (frame[offset + 2] as f32 * inv_alpha)) as u8;
+                        // Alpha blend with existing content using integer math
+                        frame[offset] = ((bg_color[0] as u16 * msg_alpha as u16 + frame[offset] as u16 * msg_inv_alpha as u16) / 255) as u8;
+                        frame[offset + 1] = ((bg_color[1] as u16 * msg_alpha as u16 + frame[offset + 1] as u16 * msg_inv_alpha as u16) / 255) as u8;
+                        frame[offset + 2] = ((bg_color[2] as u16 * msg_alpha as u16 + frame[offset + 2] as u16 * msg_inv_alpha as u16) / 255) as u8;
                         frame[offset + 3] = 255;
                     }
                 }
@@ -1285,12 +1421,12 @@ impl RickBoard {
                     if screen_x < width && screen_y < height && img_offset + 3 < image_data.len() {
                         let frame_offset = ((screen_y * width + screen_x) * 4) as usize;
                         if frame_offset + 3 < frame.len() {
-                            let alpha = image_data[img_offset + 3] as f32 / 255.0;
-                            if alpha > 0.0 {
-                                let inv_alpha = 1.0 - alpha;
-                                frame[frame_offset] = ((image_data[img_offset] as f32 * alpha) + (frame[frame_offset] as f32 * inv_alpha)) as u8;
-                                frame[frame_offset + 1] = ((image_data[img_offset + 1] as f32 * alpha) + (frame[frame_offset + 1] as f32 * inv_alpha)) as u8;
-                                frame[frame_offset + 2] = ((image_data[img_offset + 2] as f32 * alpha) + (frame[frame_offset + 2] as f32 * inv_alpha)) as u8;
+                            let alpha = image_data[img_offset + 3];
+                            if alpha > 0 {
+                                let inv_alpha = 255 - alpha;
+                                frame[frame_offset] = ((image_data[img_offset] as u16 * alpha as u16 + frame[frame_offset] as u16 * inv_alpha as u16) / 255) as u8;
+                                frame[frame_offset + 1] = ((image_data[img_offset + 1] as u16 * alpha as u16 + frame[frame_offset + 1] as u16 * inv_alpha as u16) / 255) as u8;
+                                frame[frame_offset + 2] = ((image_data[img_offset + 2] as u16 * alpha as u16 + frame[frame_offset + 2] as u16 * inv_alpha as u16) / 255) as u8;
                             }
                         }
                     }
@@ -1610,8 +1746,8 @@ impl ApplicationHandler for App {
                     let cursor_board_x = self.rickboard.board.viewport.position.x + (self.cursor_pos.0 as f32 / self.rickboard.board.viewport.zoom);
                     let cursor_board_y = self.rickboard.board.viewport.position.y + (self.cursor_pos.1 as f32 / self.rickboard.board.viewport.zoom);
                     
-                    // Apply zoom
-                    self.rickboard.board.viewport.zoom *= zoom_factor;
+                    // Apply zoom with limit
+                    self.rickboard.board.viewport.zoom = (self.rickboard.board.viewport.zoom * zoom_factor).clamp(0.1, 1.5);
                     
                     // Adjust viewport position to keep cursor at same board position
                     self.rickboard.board.viewport.position.x = cursor_board_x - (self.cursor_pos.0 as f32 / self.rickboard.board.viewport.zoom);
@@ -1769,35 +1905,60 @@ impl ApplicationHandler for App {
                 if let Some(pixels) = &mut self.pixels {
                     let frame = pixels.frame_mut();
                     
+                    let frame_start = Instant::now();
+                    
                     // Render the board's viewport to the screen
-                    match self.rickboard.board.render(self.render_width, self.render_height) {
-                        Ok(viewport_data) => {
-                            frame.copy_from_slice(&viewport_data);
-                            
-                            // Render posters on top of board background
-                            self.rickboard.render_posters(frame, self.render_width, self.render_height);
-                            
-                            // Render drawing layer on top of posters
-                            self.rickboard.board.render_drawing_layer(frame, self.render_width, self.render_height);
-                            
-                            // Render UI overlay on top
-                            self.rickboard.render_ui_overlay(frame, self.render_width, self.render_height, self.fps);
-                            
-                            // Render save progress bar
-                            let time_until_save = (60.0 - time_since_save).max(0.0);
-                            self.rickboard.render_save_progress(frame, self.render_width, time_until_save, show_save_message);
-                            
-                            if let Err(e) = pixels.render() {
-                                eprintln!("Render error: {}", e);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Board render error: {}", e);
-                        }
+                    let t0 = Instant::now();
+                    if let Err(e) = self.rickboard.board.render(frame, self.render_width, self.render_height) {
+                        eprintln!("Board render error: {}", e);
+                    }
+                    let board_time = t0.elapsed();
+                    
+                    // Render posters on top of board background
+                    let t1 = Instant::now();
+                    self.rickboard.render_posters(frame, self.render_width, self.render_height);
+                    let poster_time = t1.elapsed();
+                    
+                    // Render drawing layer on top of posters
+                    let t2 = Instant::now();
+                    self.rickboard.board.render_drawing_layer(frame, self.render_width, self.render_height);
+                    let drawing_time = t2.elapsed();
+                    
+                    // Render UI overlay on top
+                    let t3 = Instant::now();
+                    self.rickboard.render_ui_overlay(frame, self.render_width, self.render_height, self.fps);
+                    let ui_time = t3.elapsed();
+                    
+                    // Render save progress bar
+                    let t4 = Instant::now();
+                    let time_until_save = (60.0 - time_since_save).max(0.0);
+                    self.rickboard.render_save_progress(frame, self.render_width, time_until_save, show_save_message);
+                    let progress_time = t4.elapsed();
+                    
+                    // Present to screen
+                    let t5 = Instant::now();
+                    if let Err(e) = pixels.render() {
+                        eprintln!("Render error: {}", e);
+                    }
+                    let present_time = t5.elapsed();
+                    
+                    let total_time = frame_start.elapsed();
+                    
+                    // Print timing every 60 frames
+                    if self.frame_count % 60 == 0 {
+                        println!("Frame time: {:.2}ms (board: {:.2}ms, posters: {:.2}ms, drawing: {:.2}ms, ui: {:.2}ms, progress: {:.2}ms, present: {:.2}ms)",
+                            total_time.as_secs_f32() * 1000.0,
+                            board_time.as_secs_f32() * 1000.0,
+                            poster_time.as_secs_f32() * 1000.0,
+                            drawing_time.as_secs_f32() * 1000.0,
+                            ui_time.as_secs_f32() * 1000.0,
+                            progress_time.as_secs_f32() * 1000.0,
+                            present_time.as_secs_f32() * 1000.0
+                        );
                     }
                 }
                 
-                // Request another redraw to update the progress bar
+                // Request another redraw to keep the display updated
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }

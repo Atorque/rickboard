@@ -5,6 +5,7 @@ Cargo.lock
 # RickBoard data files
 rickboard.data
 posters.json
+drawing_layer.data
 
 # IDE files
 .vscode/
