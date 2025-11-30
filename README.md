@@ -2,6 +2,18 @@
 
 A high-performance virtual blackboard/whiteboard application built in Rust with disk-backed storage and cylindrical horizontal wrapping.
 
+## Screenshots
+
+<details>
+<summary>Click to view screenshots at different zoom levels</summary>
+
+<a href="screenshots/desktop_00.png"><img src="screenshots/desktop_00.png" width="400" alt="Blackboard - Zoom Level 1"></a>
+<a href="screenshots/desktop_01.png"><img src="screenshots/desktop_01.png" width="400" alt="Blackboard - Zoom Level 2"></a>
+<a href="screenshots/desktop_02.png"><img src="screenshots/desktop_02.png" width="400" alt="Blackboard - Zoom Level 3"></a>
+<a href="screenshots/desktop_03.png"><img src="screenshots/desktop_03.png" width="400" alt="Blackboard - Zoom Level 4"></a>
+
+</details>
+
 ## Features
 
 ### Canvas
