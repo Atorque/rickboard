@@ -48,6 +48,7 @@ A high-performance virtual blackboard/whiteboard application built in Rust with 
 - **Click Posters Button**: Open poster selection menu
 
 ### Poster Controls
+- **Drag & Drop**: Drag image files from desktop/explorer onto the board to instantly add them
 - **Ctrl + Left Click**: Grab and drag poster to reposition (preserves relative offset from click point)
 - **Ctrl + Scroll Wheel**: Scale poster size (range: 0.1x to 10x of original dimensions)
 - **Ctrl + Right Click**: Delete selected poster from the canvas

@@ -1,6 +1,6 @@
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 use serde::{Serialize, Deserialize};
@@ -189,6 +189,15 @@ impl Board {
     fn load_cache(&mut self) -> io::Result<()> {
         self.data_file.seek(SeekFrom::Start(HEADER_SIZE))?;
         self.data_file.read_exact(&mut self.cache)?;
+        
+        // Load drawing layer if it exists
+        if Path::new("drawing_layer.data").exists() {
+            let drawing_data = std::fs::read("drawing_layer.data")?;
+            if drawing_data.len() == self.drawing_layer.len() {
+                self.drawing_layer.copy_from_slice(&drawing_data);
+            }
+        }
+        
         Ok(())
     }
 
@@ -234,12 +243,16 @@ impl Board {
         }
     }
     
-    /// Sync pending changes to disk (write entire cache)
+    /// Sync pending changes to disk (write entire cache and drawing layer)
     fn sync(&mut self) -> io::Result<()> {
         self.write_header()?;
         self.data_file.seek(SeekFrom::Start(HEADER_SIZE))?;
         self.data_file.write_all(&self.cache)?;
         self.data_file.sync_data()?;
+        
+        // Save drawing layer
+        std::fs::write("drawing_layer.data", &self.drawing_layer)?;
+        
         Ok(())
     }
     
@@ -686,6 +699,65 @@ impl RickBoard {
             self.posters = serde_json::from_str(&json)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         }
+        Ok(())
+    }
+    
+    /// Handle dropped file - copy to posters folder and add as poster at drop location
+    fn handle_dropped_file(&mut self, path: &PathBuf, screen_x: f64, screen_y: f64) -> io::Result<()> {
+        // Check if file is an image
+        let extension = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase());
+        
+        let is_image = match extension.as_deref() {
+            Some("png") | Some("jpg") | Some("jpeg") | Some("bmp") | Some("gif") => true,
+            _ => false,
+        };
+        
+        if !is_image {
+            eprintln!("Dropped file is not a supported image format");
+            return Ok(());
+        }
+        
+        // Create posters directory if it doesn't exist
+        fs::create_dir_all("posters")?;
+        
+        // Get filename and create destination path
+        let filename = path.file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid file path"))?;
+        let dest_path = PathBuf::from("posters").join(filename);
+        
+        // Copy file to posters folder
+        fs::copy(path, &dest_path)?;
+        println!("Copied {} to posters folder", filename.to_string_lossy());
+        
+        // Load the image and add as poster at drop location
+        if let Ok(img) = image::open(&dest_path) {
+            let (width, height) = img.dimensions();
+            let rgba = img.to_rgba8();
+            let image_data = rgba.into_raw();
+            
+            // Convert screen coordinates to board coordinates
+            let board_x = self.board.viewport.position.x + (screen_x as f32 / self.board.viewport.zoom);
+            let board_y = self.board.viewport.position.y + (screen_y as f32 / self.board.viewport.zoom);
+            
+            let poster = PinnedPoster {
+                position: Point { x: board_x, y: board_y },
+                image_data,
+                width,
+                height,
+                name: filename.to_string_lossy().to_string(),
+                scale: 1.0,
+            };
+            
+            self.posters.push(poster);
+            self.save_posters()?;
+            
+            println!("Added poster '{}' at ({}, {})", filename.to_string_lossy(), board_x, board_y);
+        } else {
+            eprintln!("Failed to load image: {}", filename.to_string_lossy());
+        }
+        
         Ok(())
     }
     
@@ -1341,6 +1413,7 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => {
                 println!("Closing RickBoard...");
                 let _ = self.rickboard.board.sync();
+                let _ = self.rickboard.save_posters();
                 event_loop.exit();
             }
             
@@ -1640,6 +1713,13 @@ impl ApplicationHandler for App {
                             _ => {}
                         }
                     }
+                }
+            }
+            
+            WindowEvent::DroppedFile(path) => {
+                // Handle dropped image file
+                if let Err(e) = self.rickboard.handle_dropped_file(&path, self.cursor_pos.0, self.cursor_pos.1) {
+                    eprintln!("Error handling dropped file: {}", e);
                 }
             }
             

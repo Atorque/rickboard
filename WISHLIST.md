@@ -39,6 +39,8 @@
 - [✅] Poster persistence (posters.json)
 - [✅] Posters as overlay (non-destructive to board)
 - [✅] Poster cylindrical wrapping
+- [✅] Drag & drop images from desktop
+- [✅] Drawing layer separation (draw on top of posters)
 
 ### Performance
 - [✅] Parallel rendering (rayon CPU utilization)
@@ -59,7 +61,6 @@
 ### Media Integration
 - [  ] Embed web pages on board
 - [  ] Embed videos on board
-- [  ] Image paste from clipboard
 - [  ] Screenshot capture tool
 
 ### Drawing Tools
