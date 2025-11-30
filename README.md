@@ -33,6 +33,14 @@ A high-performance virtual blackboard/whiteboard application built in Rust with 
 - **Mouse Wheel**: Zoom in/out
 - **Click Mode Button**: Toggle Blackboard ↔ Whiteboard
 - **Click Color Marker**: Select drawing color
+- **Click Posters Button**: Open poster selection menu
+
+### Poster Controls
+- **Ctrl + Left Click**: Grab and drag poster to reposition (preserves relative offset from click point)
+- **Ctrl + Scroll Wheel**: Scale poster size (range: 0.1x to 10x of original dimensions)
+- **Ctrl + Right Click**: Delete selected poster from the canvas
+- **Posters Button**: Opens overlay showing all images in the `posters/` folder for selection
+- **Poster Placement**: After selection, click anywhere on canvas to pin the poster
 
 ### Keyboard
 - **W**: Pan up
@@ -50,10 +58,13 @@ A high-performance virtual blackboard/whiteboard application built in Rust with 
 
 ### Legend Panel (Top-Left)
 - Semi-transparent background that adapts to board mode
+- **Collapsible**: Click top bar to hide/show with smooth slide animation
 - Complete control reference
 - Brush size slider with live preview
 - FPS counter in top-right corner
 - Mode toggle button
+- Posters button
+- Poster controls reference
 
 ### Progress Bar (Top-Center)
 - Shows time until next auto-save (60-second cycle)
@@ -72,6 +83,7 @@ A high-performance virtual blackboard/whiteboard application built in Rust with 
 - **Graphics**: pixels 0.15.0, winit 0.30.12
 - **Parallel Processing**: rayon 1.11.0
 - **Image Loading**: image 0.25
+- **Serialization**: serde 1.0, serde_json 1.0 (for poster persistence)
 
 ### File Format
 - **Header**: 9 bytes (mode: 1 byte, width: 4 bytes LE, height: 4 bytes LE)
@@ -88,6 +100,11 @@ A high-performance virtual blackboard/whiteboard application built in Rust with 
 - **Parallel processing**: CPU-based with rayon for maximum utilization
 - **Alpha blending**: Transparent UI overlays
 - **Cylindrical projection**: Horizontal wrapping for infinite scrolling
+- **Poster rendering**: Drawn after canvas, before UI elements
+  - Applies viewport transformations (pan/zoom)
+  - Supports individual poster scaling with interpolation
+  - Cylindrical wrapping with dx offset calculation
+  - Alpha channel blending for transparent poster regions
 
 ### Save Mechanism
 - **Auto-save**: Every 60 seconds (only if changes detected)
@@ -130,7 +147,7 @@ cargo run --release
 ```
 rickboard/
 ├── src/
-│   └── main.rs          # Complete application (~1,250 lines)
+│   └── main.rs          # Complete application (~1,720 lines)
 ├── assetts/
 │   ├── black_marker_open.png
 │   ├── black_marker_closed.png
@@ -146,18 +163,41 @@ rickboard/
 │   ├── yellow_marker_closed.png
 │   ├── pink_marker_open.png
 │   └── pink_marker_closed.png
+├── posters/             # User-provided images for poster system
+│   └── (add .png, .jpg, .jpeg files here)
 ├── Cargo.toml           # Dependencies
 ├── rickboard.data       # Canvas storage (created on first run)
+├── posters.json         # Poster positions, scales, images (auto-created)
 └── README.md
 ```
 
 ## Data Persistence
 
+### Canvas Data
 All drawings are automatically saved to `rickboard.data` in the application directory. This file:
 - Persists between sessions
 - Can be backed up/restored
 - Can be deleted to start fresh
 - Contains the complete canvas state
+
+### Poster Data
+Poster configurations are saved to `posters.json` with the following structure:
+```json
+[
+  {
+    "position": {"x": 1000, "y": 500},
+    "image_data": [/* PNG/JPEG bytes */],
+    "width": 800,
+    "height": 600,
+    "name": "poster.png",
+    "scale": 1.5
+  }
+]
+```
+- Automatically saved when posters are added, moved, scaled, or deleted
+- Image data embedded in JSON (base64-encoded bytes)
+- Supports backward compatibility (missing scale defaults to 1.0)
+- Can be deleted to clear all posters
 
 ## Performance Characteristics
 
