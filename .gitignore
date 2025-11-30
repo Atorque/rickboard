@@ -2,8 +2,9 @@
 /target/
 Cargo.lock
 
-# RickBoard data file
+# RickBoard data files
 rickboard.data
+posters.json
 
 # IDE files
 .vscode/

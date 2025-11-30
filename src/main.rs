@@ -3,6 +3,7 @@ use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::path::Path;
 use std::rc::Rc;
 use std::time::Instant;
+use serde::{Serialize, Deserialize};
 
 // File format: 9-byte header + pixel data
 // Header: [mode: u8, width: u32 (LE), height: u32 (LE)]
@@ -17,7 +18,7 @@ use pixels::{Pixels, SurfaceTexture};
 use image::GenericImageView;
 
 /// Represents a point on the board
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Point {
     pub x: f32,
     pub y: f32,
@@ -248,31 +249,31 @@ impl Board {
         
         let new_bg = self.config.mode.background_color();
         
-        // Remap colors: swap backgrounds and only invert pure black/white
-        for i in (0..self.cache.len()).step_by(4) {
-            let r = self.cache[i];
-            let g = self.cache[i + 1];
-            let b = self.cache[i + 2];
+        // Remap colors in parallel using rayon for better performance
+        self.cache.par_chunks_mut(4).for_each(|pixel| {
+            let r = pixel[0];
+            let g = pixel[1];
+            let b = pixel[2];
             
             // Check if this pixel is the old background color
             if r == old_bg[0] && g == old_bg[1] && b == old_bg[2] {
                 // Replace with new background
-                self.cache[i] = new_bg[0];
-                self.cache[i + 1] = new_bg[1];
-                self.cache[i + 2] = new_bg[2];
+                pixel[0] = new_bg[0];
+                pixel[1] = new_bg[1];
+                pixel[2] = new_bg[2];
             } else if r == 0 && g == 0 && b == 0 {
                 // Pure black -> white
-                self.cache[i] = 255;
-                self.cache[i + 1] = 255;
-                self.cache[i + 2] = 255;
+                pixel[0] = 255;
+                pixel[1] = 255;
+                pixel[2] = 255;
             } else if r == 255 && g == 255 && b == 255 {
                 // Pure white -> black
-                self.cache[i] = 0;
-                self.cache[i + 1] = 0;
-                self.cache[i + 2] = 0;
+                pixel[0] = 0;
+                pixel[1] = 0;
+                pixel[2] = 0;
             }
             // All other colors remain unchanged
-        }
+        });
         
         self.sync()?;
         Ok(())
@@ -381,11 +382,35 @@ struct DrawingTool {
     selected_marker_index: usize,
 }
 
+/// Pinned poster on board
+#[derive(Clone, Serialize, Deserialize)]
+struct PinnedPoster {
+    position: Point,
+    image_data: Vec<u8>,  // RGBA pixel data
+    width: u32,
+    height: u32,
+    name: String,
+    #[serde(default = "default_scale")]
+    scale: f32,  // Scale factor for the poster (1.0 = original size)
+}
+
+fn default_scale() -> f32 {
+    1.0
+}
+
 /// Main application state
 struct RickBoard {
     board: Board,
     drawing_tool: DrawingTool,
     markers: Vec<ColorMarker>,
+    posters: Vec<PinnedPoster>,
+    show_poster_picker: bool,
+    available_posters: Vec<(String, String)>, // (name, path)
+    placing_poster: Option<(Vec<u8>, u32, u32, String)>, // (image_data, width, height, name) while placing
+    selected_poster_index: Option<usize>, // Index of currently selected poster for moving/scaling
+    poster_drag_offset: Option<Point>, // Offset from poster position to cursor when dragging
+    legend_collapsed: bool, // Whether the legend is collapsed
+    legend_offset: f32, // Y offset for collapse animation (0.0 = fully visible, 200.0 = fully hidden)
 }
 
 impl RickBoard {
@@ -434,6 +459,20 @@ impl RickBoard {
             .position(|m| m.color == default_color)
             .unwrap_or(0);
         
+        // Load available posters from posters/ directory
+        let mut available_posters = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("posters") {
+            for entry in entries.flatten() {
+                if let Some(path_str) = entry.path().to_str() {
+                    if path_str.ends_with(".png") || path_str.ends_with(".jpg") || path_str.ends_with(".jpeg") {
+                        if let Some(name) = entry.file_name().to_str() {
+                            available_posters.push((name.to_string(), path_str.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        
         Ok(RickBoard {
             board,
             drawing_tool: DrawingTool {
@@ -445,7 +484,21 @@ impl RickBoard {
                 selected_marker_index: selected_index,
             },
             markers,
+            posters: Vec::new(),
+            show_poster_picker: false,
+            available_posters,
+            placing_poster: None,
+            selected_poster_index: None,
+            poster_drag_offset: None,
+            legend_collapsed: false,
+            legend_offset: 0.0,
         })
+    }
+    
+    /// Initialize and load posters from file
+    fn init_with_posters(mut self) -> io::Result<Self> {
+        self.load_posters()?;
+        Ok(self)
     }
 
     fn start_drawing(&mut self, point: Point, is_eraser: bool) {
@@ -537,18 +590,135 @@ impl RickBoard {
         Ok(())
     }
     
+    /// Find poster at given board coordinates (returns index, checks from top to bottom)
+    fn find_poster_at(&self, board_x: f32, board_y: f32) -> Option<usize> {
+        // Check posters in reverse order (top to bottom)
+        for (i, poster) in self.posters.iter().enumerate().rev() {
+            let poster_width = poster.width as f32 * poster.scale;
+            let poster_height = poster.height as f32 * poster.scale;
+            
+            if board_x >= poster.position.x && board_x < poster.position.x + poster_width &&
+               board_y >= poster.position.y && board_y < poster.position.y + poster_height {
+                return Some(i);
+            }
+        }
+        None
+    }
+    
+    /// Toggle legend collapse state
+    fn toggle_legend(&mut self) {
+        self.legend_collapsed = !self.legend_collapsed;
+    }
+    
+    /// Update legend animation (smooth slide in/out)
+    fn update_legend_animation(&mut self) {
+        let target_offset = if self.legend_collapsed { 270.0 } else { 0.0 };
+        let speed = 15.0; // pixels per frame
+        
+        if (self.legend_offset - target_offset).abs() > 0.5 {
+            if self.legend_offset < target_offset {
+                self.legend_offset = (self.legend_offset + speed).min(target_offset);
+            } else {
+                self.legend_offset = (self.legend_offset - speed).max(target_offset);
+            }
+        } else {
+            self.legend_offset = target_offset;
+        }
+    }
+    
+    /// Save posters to JSON file
+    fn save_posters(&self) -> io::Result<()> {
+        let json = serde_json::to_string_pretty(&self.posters)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        std::fs::write("posters.json", json)?;
+        Ok(())
+    }
+    
+    /// Load posters from JSON file
+    fn load_posters(&mut self) -> io::Result<()> {
+        if Path::new("posters.json").exists() {
+            let json = std::fs::read_to_string("posters.json")?;
+            self.posters = serde_json::from_str(&json)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        }
+        Ok(())
+    }
+    
     /// Handle click on UI elements, returns true if click was on UI
-    fn handle_ui_click(&mut self, x: f64, y: f64, render_height: u32) -> io::Result<(bool, bool)> {
+    fn handle_ui_click(&mut self, x: f64, y: f64, render_height: u32, render_width: u32) -> io::Result<(bool, bool)> {
         // Returns (clicked_on_ui, mode_was_toggled)
         
-        // Check if click is on mode toggle button (x:20-135, y:170-190)
-        if x >= 20.0 && x <= 135.0 && y >= 170.0 && y <= 190.0 {
+        // Apply legend offset to y-coordinate for click detection
+        let y_offset = -(self.legend_offset as f64);
+        let adjusted_y = y - y_offset;
+        
+        // Check for click on legend collapse/expand area (top bar: x:10-290)
+        // When collapsed, check the actual visible screen position
+        // When expanded, check the adjusted position
+        let is_top_bar_click = if self.legend_collapsed {
+            // When collapsed, the visible hint bar is near y:0-20
+            x >= 10.0 && x <= 290.0 && y >= 0.0 && y <= 30.0
+        } else {
+            // When expanded, use adjusted coordinates
+            x >= 10.0 && x <= 290.0 && adjusted_y >= 0.0 && adjusted_y <= 20.0
+        };
+        
+        if is_top_bar_click {
+            self.toggle_legend();
+            return Ok((true, false));
+        }
+        
+        // Only check other UI elements if legend is not fully collapsed
+        if self.legend_offset >= 269.0 {
+            return Ok((false, false));
+        }
+        
+        // Check if poster picker is open and handle clicks on it
+        if self.show_poster_picker {
+            let panel_width = 400u32;
+            let panel_height = 300u32;
+            let panel_x = (render_width / 2).saturating_sub(panel_width / 2);
+            let panel_y = (render_height / 2).saturating_sub(panel_height / 2);
+            
+            // Check if click is within the poster picker panel
+            if x >= panel_x as f64 && x <= (panel_x + panel_width) as f64 &&
+               y >= panel_y as f64 && y <= (panel_y + panel_height) as f64 {
+                // Check which poster was clicked (each poster is 20 pixels tall, starting at y_offset 40)
+                let relative_y = (y - panel_y as f64 - 40.0) as i32;
+                if relative_y >= 0 {
+                    let poster_index = (relative_y / 20) as usize;
+                    if poster_index < self.available_posters.len() {
+                        // Load the selected poster
+                        if let Some((_name, path)) = self.available_posters.get(poster_index) {
+                            if let Ok(img) = image::open(path) {
+                                let (width, height) = img.dimensions();
+                                let rgba = img.to_rgba8();
+                                let image_data = rgba.into_raw();
+                                let name = self.available_posters[poster_index].0.clone();
+                                self.placing_poster = Some((image_data, width, height, name));
+                                self.show_poster_picker = false;
+                            }
+                        }
+                    }
+                }
+                return Ok((true, false));
+            }
+        }
+        
+        // Check if click is on mode toggle button (x:20-135, y:170-190) with offset
+        if x >= 20.0 && x <= 135.0 && adjusted_y >= 170.0 && adjusted_y <= 190.0 {
             self.toggle_mode()?;
             return Ok((true, true));
         }
         
-        // Check if click is on slider (x:20-160, y:150-165)
-        if x >= 20.0 && x <= 160.0 && y >= 150.0 && y <= 165.0 {
+        // Check if click is on Posters button (x:145-210, y:170-190) with offset
+        if x >= 145.0 && x <= 210.0 && adjusted_y >= 170.0 && adjusted_y <= 190.0 {
+            self.show_poster_picker = !self.show_poster_picker;
+            return Ok((true, false));
+        }
+        
+        // Check if click is on slider (x:20-160, y:150-165) with offset
+        if x >= 20.0 && x <= 160.0 && adjusted_y >= 150.0 && adjusted_y <= 165.0 {
             // Calculate brush size from x position
             let slider_x = (x - 20.0).max(0.0).min(140.0);
             self.drawing_tool.brush_size = ((slider_x / 140.0) * 100.0).round() as u32;
@@ -589,6 +759,66 @@ impl RickBoard {
         Ok((false, false))
     }
     
+    /// Render pinned posters as overlay on top of board
+    fn render_posters(&self, frame: &mut [u8], width: u32, height: u32) {
+        let zoom = self.board.viewport.zoom;
+        let board_width = self.board.config.width as f32;
+        
+        for poster in &self.posters {
+            // Apply cylindrical wrapping: calculate wrapped x position
+            let wrapped_x = poster.position.x;
+            let viewport_x = self.board.viewport.position.x;
+            
+            // Calculate the difference and wrap it
+            let mut dx = wrapped_x - viewport_x;
+            while dx < 0.0 {
+                dx += board_width;
+            }
+            while dx >= board_width {
+                dx -= board_width;
+            }
+            
+            // Calculate screen position with cylindrical wrapping
+            let screen_x = (dx * zoom) as i32;
+            let screen_y = ((poster.position.y - self.board.viewport.position.y) * zoom) as i32;
+            
+            // Calculate scaled poster dimensions (applying both poster scale and viewport zoom)
+            let scaled_width = (poster.width as f32 * poster.scale * zoom) as u32;
+            let scaled_height = (poster.height as f32 * poster.scale * zoom) as u32;
+            
+            // Render poster pixels with scaling
+            for sy in 0..scaled_height as i32 {
+                for sx in 0..scaled_width as i32 {
+                    let screen_px = screen_x + sx;
+                    let screen_py = screen_y + sy;
+                    
+                    // Check if pixel is within screen bounds
+                    if screen_px >= 0 && screen_px < width as i32 && screen_py >= 0 && screen_py < height as i32 {
+                        // Map screen pixel back to poster pixel (inverse of both scales)
+                        let poster_px = (sx as f32 / (poster.scale * zoom)) as u32;
+                        let poster_py = (sy as f32 / (poster.scale * zoom)) as u32;
+                        
+                        if poster_px < poster.width && poster_py < poster.height {
+                            let poster_offset = ((poster_py * poster.width + poster_px) * 4) as usize;
+                            let screen_offset = ((screen_py * width as i32 + screen_px) * 4) as usize;
+                            
+                            if poster_offset + 3 < poster.image_data.len() && screen_offset + 3 < frame.len() {
+                                // Alpha blend the poster with the background
+                                let alpha = poster.image_data[poster_offset + 3] as f32 / 255.0;
+                                let inv_alpha = 1.0 - alpha;
+                                
+                                frame[screen_offset] = ((poster.image_data[poster_offset] as f32 * alpha) + (frame[screen_offset] as f32 * inv_alpha)) as u8;
+                                frame[screen_offset + 1] = ((poster.image_data[poster_offset + 1] as f32 * alpha) + (frame[screen_offset + 1] as f32 * inv_alpha)) as u8;
+                                frame[screen_offset + 2] = ((poster.image_data[poster_offset + 2] as f32 * alpha) + (frame[screen_offset + 2] as f32 * inv_alpha)) as u8;
+                                frame[screen_offset + 3] = 255;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
     /// Render UI overlay (legend and brush controls)
     fn render_ui_overlay(&self, frame: &mut [u8], width: u32, height: u32, fps: f32) {
         let text_color = match self.board.config.mode {
@@ -602,10 +832,15 @@ impl RickBoard {
             BoardMode::Whiteboard => [255u8, 255u8, 255u8, 153u8], // 60% transparent white
         };
         
-        // Draw background panel (top-left, 280x220 pixels)
-        for y in 10..230 {
+        // Apply collapse animation offset
+        let y_offset = -(self.legend_offset as i32);
+        
+        // Draw background panel (top-left, from y:0 to y:280, 290 pixels wide)
+        for y in 0..280 {
+            let screen_y = y + y_offset;
+            if screen_y < 0 || screen_y >= height as i32 { continue; }
             for x in 10..290 {
-                let offset = ((y * width + x) * 4) as usize;
+                let offset = ((screen_y as u32 * width + x) * 4) as usize;
                 if offset + 3 < frame.len() {
                     // Alpha blend with existing content for transparency
                     let alpha = bg_color[3] as f32 / 255.0;
@@ -618,41 +853,52 @@ impl RickBoard {
             }
         }
         
+        // Helper to draw text with y-offset
+        let draw_text = |f: &mut [u8], w: u32, x: u32, y: u32, text: &str, color: [u8; 4]| {
+            let screen_y = y as i32 + y_offset;
+            if screen_y >= 0 && screen_y < height as i32 {
+                self.draw_simple_text(f, w, x, screen_y as u32, text, color);
+            }
+        };
+        
         // Render text legend (simplified - just draw simple characters)
-        self.draw_simple_text(frame, width, 20, 20, "CONTROLS:", text_color);
-        self.draw_simple_text(frame, width, 20, 35, "Left Click: Draw", text_color);
-        self.draw_simple_text(frame, width, 20, 48, "Right Click: Erase", text_color);
-        self.draw_simple_text(frame, width, 20, 61, "WASD: Pan", text_color);
-        self.draw_simple_text(frame, width, 20, 74, "Mouse Wheel: Zoom", text_color);
-        self.draw_simple_text(frame, width, 20, 87, "+/- Keys: Brush Size", text_color);
-        self.draw_simple_text(frame, width, 20, 100, "C Key: Clear Board", text_color);
-        self.draw_simple_text(frame, width, 20, 113, "P Key: Save", text_color);
-        self.draw_simple_text(frame, width, 20, 126, "ESC: Exit", text_color);
+        draw_text(frame, width, 20, 20, "CONTROLS:", text_color);
+        draw_text(frame, width, 20, 35, "Left Click: Draw", text_color);
+        draw_text(frame, width, 20, 48, "Right Click: Erase", text_color);
+        draw_text(frame, width, 20, 61, "WASD: Pan", text_color);
+        draw_text(frame, width, 20, 74, "Mouse Wheel: Zoom", text_color);
+        draw_text(frame, width, 20, 87, "+ - Keys: Brush Size", text_color);
+        draw_text(frame, width, 20, 100, "C Key: Clear Board", text_color);
+        draw_text(frame, width, 20, 113, "P Key: Save", text_color);
+        draw_text(frame, width, 20, 126, "ESC: Exit", text_color);
         
         // Draw FPS in top-right corner of legend panel
         let fps_text = format!("FPS: {:.1}", fps);
-        self.draw_simple_text(frame, width, 210, 20, &fps_text, text_color);
+        draw_text(frame, width, 210, 20, &fps_text, text_color);
         
         // Draw brush size slider
-        self.draw_simple_text(frame, width, 20, 135, &format!("Brush: {}", self.drawing_tool.brush_size), text_color);
+        draw_text(frame, width, 20, 139, &format!("Brush: {}", self.drawing_tool.brush_size), text_color);
         
-        // Draw slider bar (140 pixels wide)
+        // Draw slider bar (140 pixels wide) with offset
         for x in 20..160 {
             for dy in 0..3 {
-                let offset = (((155 + dy) * width + x) * 4) as usize;
-                if offset + 3 < frame.len() {
-                    frame[offset..offset + 4].copy_from_slice(&text_color);
+                let screen_y = 155 + dy + y_offset;
+                if screen_y >= 0 && screen_y < height as i32 {
+                    let offset = ((screen_y as u32 * width + x) * 4) as usize;
+                    if offset + 3 < frame.len() {
+                        frame[offset..offset + 4].copy_from_slice(&text_color);
+                    }
                 }
             }
         }
         
-        // Draw slider position indicator
+        // Draw slider position indicator with offset
         let slider_pos = 20 + ((self.drawing_tool.brush_size.min(100) * 140) / 100) as u32;
         for dy in -5..=5 {
             for dx in -2..=2 {
-                let py = 156 + dy;
+                let py = 156 + dy + y_offset;
                 let px = slider_pos as i32 + dx;
-                if px >= 0 && py >= 0 {
+                if px >= 0 && py >= 0 && py < height as i32 {
                     let offset = ((py as u32 * width + px as u32) * 4) as usize;
                     if offset + 3 < frame.len() {
                         frame[offset..offset + 4].copy_from_slice(&[255, 100, 100, 255]);
@@ -661,7 +907,7 @@ impl RickBoard {
             }
         }
         
-        // Draw brush preview circle
+        // Draw brush preview circle with offset
         let preview_x = 210;
         let preview_y = 86;
         let radius = (self.drawing_tool.brush_size / 2).min(50) as i32;
@@ -669,8 +915,8 @@ impl RickBoard {
             for dx in -radius..=radius {
                 if dx * dx + dy * dy <= radius * radius {
                     let px = preview_x + dx;
-                    let py = preview_y + dy;
-                    if px >= 0 && py >= 0 {
+                    let py = preview_y + dy + y_offset;
+                    if px >= 0 && py >= 0 && py < height as i32 {
                         let offset = ((py as u32 * width + px as u32) * 4) as usize;
                         if offset + 3 < frame.len() {
                             frame[offset..offset + 4].copy_from_slice(&text_color);
@@ -685,19 +931,121 @@ impl RickBoard {
             BoardMode::Blackboard => "Mode: Blackboard",
             BoardMode::Whiteboard => "Mode: Whiteboard",
         };
-        self.draw_simple_text(frame, width, 30, 175, button_text, text_color);
+        draw_text(frame, width, 30, 175, button_text, text_color);
         
-        // Draw button border (clickable area: x:20-135, y:170-190)
+        // Draw button border (clickable area: x:20-135, y:170-190) with offset
         for x in 20..135 {
             for y in [170, 189].iter() {
+                let screen_y = *y as i32 + y_offset;
+                if screen_y >= 0 && screen_y < height as i32 {
+                    let offset = ((screen_y as u32 * width + x) * 4) as usize;
+                    if offset + 3 < frame.len() {
+                        frame[offset..offset + 4].copy_from_slice(&text_color);
+                    }
+                }
+            }
+        }
+        for y in 170..190 {
+            let screen_y = y as i32 + y_offset;
+            if screen_y >= 0 && screen_y < height as i32 {
+                for x in [20, 134].iter() {
+                    let offset = ((screen_y as u32 * width + *x) * 4) as usize;
+                    if offset + 3 < frame.len() {
+                        frame[offset..offset + 4].copy_from_slice(&text_color);
+                    }
+                }
+            }
+        }
+        
+        // Draw Posters button (next to mode button)
+        draw_text(frame, width, 150, 175, "Posters", text_color);
+        
+        // Draw button border (clickable area: x:145-210, y:170-190) with offset
+        for x in 145..210 {
+            for y in [170, 189].iter() {
+                let screen_y = *y as i32 + y_offset;
+                if screen_y >= 0 && screen_y < height as i32 {
+                    let offset = ((screen_y as u32 * width + x) * 4) as usize;
+                    if offset + 3 < frame.len() {
+                        frame[offset..offset + 4].copy_from_slice(&text_color);
+                    }
+                }
+            }
+        }
+        for y in 170..190 {
+            let screen_y = y as i32 + y_offset;
+            if screen_y >= 0 && screen_y < height as i32 {
+                for x in [145, 209].iter() {
+                    let offset = ((screen_y as u32 * width + *x) * 4) as usize;
+                    if offset + 3 < frame.len() {
+                        frame[offset..offset + 4].copy_from_slice(&text_color);
+                    }
+                }
+            }
+        }
+        
+        // Draw poster controls help text
+        draw_text(frame, width, 20, 205, "Poster Controls:", text_color);
+        draw_text(frame, width, 20, 220, "Ctrl+Click: Move", text_color);
+        draw_text(frame, width, 20, 235, "Ctrl+Wheel: Scale", text_color);
+        draw_text(frame, width, 20, 250, "Ctrl+RClick: Delete", text_color);
+        
+        // Draw collapse/expand hint at top
+        let hint_text = if self.legend_collapsed { "Click to show" } else { "Click to hide" };
+        draw_text(frame, width, 100, 5, hint_text, text_color);
+        
+        // Render color markers at bottom-left corner
+        self.render_markers(frame, width, height);
+        
+        // Render poster picker if active
+        if self.show_poster_picker {
+            self.render_poster_picker(frame, width, height);
+        }
+    }
+    
+    /// Render poster picker overlay
+    fn render_poster_picker(&self, frame: &mut [u8], width: u32, height: u32) {
+        let text_color = match self.board.config.mode {
+            BoardMode::Blackboard => [255u8, 255u8, 255u8, 255u8],
+            BoardMode::Whiteboard => [0u8, 0u8, 0u8, 255u8],
+        };
+        
+        let bg_color = match self.board.config.mode {
+            BoardMode::Blackboard => [0u8, 0u8, 0u8, 200u8],
+            BoardMode::Whiteboard => [255u8, 255u8, 255u8, 200u8],
+        };
+        
+        // Draw semi-transparent overlay panel (center of screen)
+        let panel_width = 400u32;
+        let panel_height = 300u32;
+        let panel_x = (width / 2).saturating_sub(panel_width / 2);
+        let panel_y = (height / 2).saturating_sub(panel_height / 2);
+        
+        for y in panel_y..panel_y + panel_height {
+            for x in panel_x..panel_x + panel_width {
+                let offset = ((y * width + x) * 4) as usize;
+                if offset + 3 < frame.len() {
+                    let alpha = bg_color[3] as f32 / 255.0;
+                    let inv_alpha = 1.0 - alpha;
+                    frame[offset] = ((bg_color[0] as f32 * alpha) + (frame[offset] as f32 * inv_alpha)) as u8;
+                    frame[offset + 1] = ((bg_color[1] as f32 * alpha) + (frame[offset + 1] as f32 * inv_alpha)) as u8;
+                    frame[offset + 2] = ((bg_color[2] as f32 * alpha) + (frame[offset + 2] as f32 * inv_alpha)) as u8;
+                    frame[offset + 3] = 255;
+                }
+            }
+        }
+        
+        // Draw border
+        for x in panel_x..panel_x + panel_width {
+            for y in [panel_y, panel_y + panel_height - 1].iter() {
                 let offset = ((*y * width + x) * 4) as usize;
                 if offset + 3 < frame.len() {
                     frame[offset..offset + 4].copy_from_slice(&text_color);
                 }
             }
         }
-        for y in 170..190 {
-            for x in [20, 134].iter() {
+        for y in panel_y..panel_y + panel_height {
+            for x in [panel_x, panel_x + panel_width - 1].iter() {
                 let offset = ((y * width + *x) * 4) as usize;
                 if offset + 3 < frame.len() {
                     frame[offset..offset + 4].copy_from_slice(&text_color);
@@ -705,8 +1053,18 @@ impl RickBoard {
             }
         }
         
-        // Render color markers at bottom-left corner
-        self.render_markers(frame, width, height);
+        // Draw title
+        self.draw_simple_text(frame, width, panel_x + 10, panel_y + 10, "Select a Poster:", text_color);
+        
+        // List available posters
+        let mut y_offset = 40;
+        for (i, (name, _path)) in self.available_posters.iter().enumerate() {
+            let display_text = format!("{}. {}", i + 1, name);
+            self.draw_simple_text(frame, width, panel_x + 20, panel_y + y_offset, &display_text, text_color);
+            y_offset += 20;
+        }
+        
+        self.draw_simple_text(frame, width, panel_x + 10, panel_y + panel_height - 25, "Click poster name to select", text_color);
     }
     
     /// Render save progress bar at top center
@@ -964,12 +1322,46 @@ impl ApplicationHandler for App {
                         match state {
                             ElementState::Pressed => {
                                 // Check if click is on UI first
-                                if let Ok((on_ui, mode_toggled)) = self.rickboard.handle_ui_click(self.cursor_pos.0, self.cursor_pos.1, self.render_height) {
+                                if let Ok((on_ui, mode_toggled)) = self.rickboard.handle_ui_click(self.cursor_pos.0, self.cursor_pos.1, self.render_height, self.render_width) {
                                     if mode_toggled {
                                         self.has_unsaved_changes = true;
                                     }
                                     if !on_ui {
-                                        self.mouse_down = true;
+                                        // Check if we're placing a poster
+                                        if let Some((image_data, width, height, name)) = self.rickboard.placing_poster.take() {
+                                            // Convert screen coords to board coords
+                                            let board_x = self.rickboard.board.viewport.position.x + self.cursor_pos.0 as f32 / self.rickboard.board.viewport.zoom;
+                                            let board_y = self.rickboard.board.viewport.position.y + self.cursor_pos.1 as f32 / self.rickboard.board.viewport.zoom;
+                                            
+                                            self.rickboard.posters.push(PinnedPoster {
+                                                position: Point { x: board_x, y: board_y },
+                                                image_data,
+                                                width,
+                                                height,
+                                                name,
+                                                scale: 1.0,
+                                            });
+                                            self.has_unsaved_changes = true;
+                                        } else if self.modifiers.control_key() {
+                                            // Ctrl+Click to select/move poster
+                                            let board_x = self.rickboard.board.viewport.position.x + self.cursor_pos.0 as f32 / self.rickboard.board.viewport.zoom;
+                                            let board_y = self.rickboard.board.viewport.position.y + self.cursor_pos.1 as f32 / self.rickboard.board.viewport.zoom;
+                                            
+                                            if let Some(poster_idx) = self.rickboard.find_poster_at(board_x, board_y) {
+                                                self.rickboard.selected_poster_index = Some(poster_idx);
+                                                // Calculate drag offset
+                                                let poster = &self.rickboard.posters[poster_idx];
+                                                self.rickboard.poster_drag_offset = Some(Point {
+                                                    x: board_x - poster.position.x,
+                                                    y: board_y - poster.position.y,
+                                                });
+                                            } else {
+                                                self.rickboard.selected_poster_index = None;
+                                                self.rickboard.poster_drag_offset = None;
+                                            }
+                                        } else {
+                                            self.mouse_down = true;
+                                        }
                                     }
                                     if let Some(window) = &self.window {
                                         window.request_redraw();
@@ -979,13 +1371,33 @@ impl ApplicationHandler for App {
                             ElementState::Released => {
                                 self.mouse_down = false;
                                 self.rickboard.stop_drawing();
+                                // Release poster drag
+                                if self.rickboard.selected_poster_index.is_some() {
+                                    self.rickboard.selected_poster_index = None;
+                                    self.rickboard.poster_drag_offset = None;
+                                    self.has_unsaved_changes = true;
+                                }
                             }
                         }
                     }
                     MouseButton::Right => {
                         match state {
                             ElementState::Pressed => {
-                                self.right_mouse_down = true;
+                                if self.modifiers.control_key() {
+                                    // Ctrl+Right Click to delete poster
+                                    let board_x = self.rickboard.board.viewport.position.x + self.cursor_pos.0 as f32 / self.rickboard.board.viewport.zoom;
+                                    let board_y = self.rickboard.board.viewport.position.y + self.cursor_pos.1 as f32 / self.rickboard.board.viewport.zoom;
+                                    
+                                    if let Some(poster_idx) = self.rickboard.find_poster_at(board_x, board_y) {
+                                        self.rickboard.posters.remove(poster_idx);
+                                        self.has_unsaved_changes = true;
+                                        if let Some(window) = &self.window {
+                                            window.request_redraw();
+                                        }
+                                    }
+                                } else {
+                                    self.right_mouse_down = true;
+                                }
                             }
                             ElementState::Released => {
                                 self.right_mouse_down = false;
@@ -1000,9 +1412,25 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x, position.y);
                 
+                // Move poster if one is selected
+                if let (Some(poster_idx), Some(offset)) = (self.rickboard.selected_poster_index, self.rickboard.poster_drag_offset) {
+                    let board_x = self.rickboard.board.viewport.position.x + self.cursor_pos.0 as f32 / self.rickboard.board.viewport.zoom;
+                    let board_y = self.rickboard.board.viewport.position.y + self.cursor_pos.1 as f32 / self.rickboard.board.viewport.zoom;
+                    
+                    if let Some(poster) = self.rickboard.posters.get_mut(poster_idx) {
+                        poster.position.x = board_x - offset.x;
+                        poster.position.y = board_y - offset.y;
+                    }
+                    
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return; // Don't draw on board while dragging poster
+                }
+                
                 // Handle slider dragging
                 if self.mouse_down && position.x >= 20.0 && position.x <= 160.0 && position.y >= 150.0 && position.y <= 165.0 {
-                    let _ = self.rickboard.handle_ui_click(position.x, position.y, self.render_height);
+                    let _ = self.rickboard.handle_ui_click(position.x, position.y, self.render_height, self.render_width);
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
@@ -1028,28 +1456,52 @@ impl ApplicationHandler for App {
             }
             
             WindowEvent::MouseWheel { delta, .. } => {
-                let zoom_factor = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => {
-                        if y > 0.0 { 1.1 } else { 0.9 }
+                if self.modifiers.control_key() {
+                    // Ctrl+Wheel: Scale selected poster
+                    let delta_y = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y,
+                        MouseScrollDelta::PixelDelta(pos) => (pos.y / 20.0) as f32,
+                    };
+                    
+                    let board_x = self.rickboard.board.viewport.position.x + self.cursor_pos.0 as f32 / self.rickboard.board.viewport.zoom;
+                    let board_y = self.rickboard.board.viewport.position.y + self.cursor_pos.1 as f32 / self.rickboard.board.viewport.zoom;
+                    
+                    if let Some(poster_idx) = self.rickboard.find_poster_at(board_x, board_y) {
+                        if let Some(poster) = self.rickboard.posters.get_mut(poster_idx) {
+                            let scale_factor = if delta_y > 0.0 { 1.1 } else { 0.9 };
+                            poster.scale = (poster.scale * scale_factor).clamp(0.1, 10.0);
+                            self.has_unsaved_changes = true;
+                            
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        }
                     }
-                    MouseScrollDelta::PixelDelta(pos) => {
-                        if pos.y > 0.0 { 1.1 } else { 0.9 }
+                } else {
+                    // Normal wheel: Zoom viewport
+                    let zoom_factor = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => {
+                            if y > 0.0 { 1.1 } else { 0.9 }
+                        }
+                        MouseScrollDelta::PixelDelta(pos) => {
+                            if pos.y > 0.0 { 1.1 } else { 0.9 }
+                        }
+                    };
+                    
+                    // Calculate board position at cursor before zoom
+                    let cursor_board_x = self.rickboard.board.viewport.position.x + (self.cursor_pos.0 as f32 / self.rickboard.board.viewport.zoom);
+                    let cursor_board_y = self.rickboard.board.viewport.position.y + (self.cursor_pos.1 as f32 / self.rickboard.board.viewport.zoom);
+                    
+                    // Apply zoom
+                    self.rickboard.board.viewport.zoom *= zoom_factor;
+                    
+                    // Adjust viewport position to keep cursor at same board position
+                    self.rickboard.board.viewport.position.x = cursor_board_x - (self.cursor_pos.0 as f32 / self.rickboard.board.viewport.zoom);
+                    self.rickboard.board.viewport.position.y = cursor_board_y - (self.cursor_pos.1 as f32 / self.rickboard.board.viewport.zoom);
+                    
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
                     }
-                };
-                
-                // Calculate board position at cursor before zoom
-                let cursor_board_x = self.rickboard.board.viewport.position.x + (self.cursor_pos.0 as f32 / self.rickboard.board.viewport.zoom);
-                let cursor_board_y = self.rickboard.board.viewport.position.y + (self.cursor_pos.1 as f32 / self.rickboard.board.viewport.zoom);
-                
-                // Apply zoom
-                self.rickboard.board.viewport.zoom *= zoom_factor;
-                
-                // Adjust viewport position to keep cursor at same board position
-                self.rickboard.board.viewport.position.x = cursor_board_x - (self.cursor_pos.0 as f32 / self.rickboard.board.viewport.zoom);
-                self.rickboard.board.viewport.position.y = cursor_board_y - (self.cursor_pos.1 as f32 / self.rickboard.board.viewport.zoom);
-                
-                if let Some(window) = &self.window {
-                    window.request_redraw();
                 }
             }
             
@@ -1115,6 +1567,10 @@ impl ApplicationHandler for App {
                                 } else {
                                     self.has_unsaved_changes = false;
                                 }
+                                // Save posters
+                                if let Err(e) = self.rickboard.save_posters() {
+                                    eprintln!("Poster save error: {}", e);
+                                }
                                 self.last_save = Instant::now(); // Reset timer
                                 self.save_message_until = Some(Instant::now() + std::time::Duration::from_millis(500));
                                 self.is_saving = false;
@@ -1143,6 +1599,9 @@ impl ApplicationHandler for App {
             }
             
             WindowEvent::RedrawRequested => {
+                // Update legend animation
+                self.rickboard.update_legend_animation();
+                
                 // Update FPS counter
                 self.frame_count += 1;
                 let elapsed = self.last_fps_update.elapsed();
@@ -1160,6 +1619,10 @@ impl ApplicationHandler for App {
                         eprintln!("Auto-save error: {}", e);
                     } else {
                         self.has_unsaved_changes = false;
+                    }
+                    // Save posters
+                    if let Err(e) = self.rickboard.save_posters() {
+                        eprintln!("Auto-save poster error: {}", e);
                     }
                     self.last_save = Instant::now();
                     self.save_message_until = Some(Instant::now() + std::time::Duration::from_millis(500));
@@ -1185,6 +1648,9 @@ impl ApplicationHandler for App {
                     match self.rickboard.board.render(self.render_width, self.render_height) {
                         Ok(viewport_data) => {
                             frame.copy_from_slice(&viewport_data);
+                            
+                            // Render posters on top of board but below UI
+                            self.rickboard.render_posters(frame, self.render_width, self.render_height);
                             
                             // Render UI overlay on top
                             self.rickboard.render_ui_overlay(frame, self.render_width, self.render_height, self.fps);
@@ -1220,7 +1686,7 @@ fn main() {
     
     let board_path = Path::new("rickboard.data");
     
-    match RickBoard::new(80000, 1000, mode, board_path) {
+    match RickBoard::new(80000, 1000, mode, board_path).and_then(|rb| rb.init_with_posters()) {
         Ok(rickboard) => {
             let event_loop = EventLoop::new().unwrap();
             event_loop.set_control_flow(ControlFlow::Wait);
