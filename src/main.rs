@@ -61,8 +61,9 @@ struct Board {
     config: BoardConfig,
     data_file: File,
     pub viewport: Viewport,
-    cache: Vec<u8>,  // In-memory cache of entire board for fast rendering
-    undo_stack: Vec<Vec<u8>>,  // Store up to 3 previous board states
+    cache: Vec<u8>,  // In-memory cache of entire board for fast rendering (background only)
+    drawing_layer: Vec<u8>,  // Transparent drawing layer on top of posters (RGBA)
+    undo_stack: Vec<Vec<u8>>,  // Store up to 3 previous drawing layer states
 }
 
 /// Camera/viewport for navigation
@@ -142,6 +143,9 @@ impl Board {
         let cache_size = (loaded_width as usize) * (loaded_height as usize) * 4;
         let cache = vec![0u8; cache_size];
         
+        // Allocate transparent drawing layer (all pixels start fully transparent)
+        let drawing_layer = vec![0u8; cache_size];
+        
         let mut board = Board {
             config,
             data_file,
@@ -150,6 +154,7 @@ impl Board {
                 zoom: 1.0,
             },
             cache,
+            drawing_layer,
             undo_stack: Vec::new(),
         };
 
@@ -187,7 +192,7 @@ impl Board {
         Ok(())
     }
 
-    /// Draw a pixel at the given position (only writes to cache)
+    /// Draw a pixel at the given position (writes to drawing layer)
     #[inline(always)]
     fn draw_pixel(&mut self, x: i32, y: i32, color: [u8; 4]) {
         // Only wrap horizontally (cylindrical), reject out-of-bounds vertical coords
@@ -201,16 +206,16 @@ impl Board {
         let offset = (((y as u64) * (self.config.width as u64) + (wrapped_x as u64)) 
             * (self.config.pixel_size as u64)) as usize;
 
-        // Write to cache using direct pointer write for maximum speed
+        // Write to drawing layer using direct pointer write for maximum speed
         unsafe {
-            let ptr = self.cache.as_mut_ptr().add(offset) as *mut u32;
+            let ptr = self.drawing_layer.as_mut_ptr().add(offset) as *mut u32;
             *ptr = u32::from_ne_bytes(color);
         }
     }
     
-    /// Save current board state to undo stack (keep max 3 states)
+    /// Save current drawing layer state to undo stack (keep max 3 states)
     fn save_undo_state(&mut self) {
-        let snapshot = self.cache.clone();
+        let snapshot = self.drawing_layer.clone();
         self.undo_stack.push(snapshot);
         
         // Keep only last 3 states
@@ -219,10 +224,10 @@ impl Board {
         }
     }
     
-    /// Undo last operation by restoring previous state
+    /// Undo last operation by restoring previous drawing layer state
     fn undo(&mut self) -> bool {
         if let Some(previous_state) = self.undo_stack.pop() {
-            self.cache = previous_state;
+            self.drawing_layer = previous_state;
             true
         } else {
             false
@@ -288,6 +293,11 @@ impl Board {
         // Fill cache with background color
         for i in (0..self.cache.len()).step_by(4) {
             self.cache[i..i+4].copy_from_slice(&bg_color);
+        }
+        
+        // Clear drawing layer (fully transparent)
+        for i in 0..self.drawing_layer.len() {
+            self.drawing_layer[i] = 0;
         }
         
         // Write cache to disk in chunks
@@ -360,6 +370,41 @@ impl Board {
             });
 
         Ok(framebuffer)
+    }
+    
+    /// Render the drawing layer with alpha blending on top of the current frame
+    fn render_drawing_layer(&self, frame: &mut [u8], screen_width: u32, screen_height: u32) {
+        let start_x = self.viewport.position.x as i32;
+        let start_y = self.viewport.position.y as i32;
+        let zoom = self.viewport.zoom;
+        let width = self.config.width as i32;
+        let height = self.config.height as i32;
+        
+        for screen_y in 0..screen_height {
+            let board_y = start_y + ((screen_y as f32) / zoom) as i32;
+            
+            if board_y >= 0 && board_y < height {
+                let row_start_offset = (board_y as usize) * (width as usize) * 4;
+                
+                for screen_x in 0..screen_width {
+                    let board_x = start_x + ((screen_x as f32) / zoom) as i32;
+                    let wrapped_x = board_x.rem_euclid(width) as usize;
+                    let src_offset = row_start_offset + (wrapped_x * 4);
+                    let dst_offset = ((screen_y * screen_width + screen_x) * 4) as usize;
+                    
+                    if src_offset + 3 < self.drawing_layer.len() && dst_offset + 3 < frame.len() {
+                        let alpha = self.drawing_layer[src_offset + 3] as f32 / 255.0;
+                        
+                        if alpha > 0.0 {
+                            let inv_alpha = 1.0 - alpha;
+                            frame[dst_offset] = ((self.drawing_layer[src_offset] as f32 * alpha) + (frame[dst_offset] as f32 * inv_alpha)) as u8;
+                            frame[dst_offset + 1] = ((self.drawing_layer[src_offset + 1] as f32 * alpha) + (frame[dst_offset + 1] as f32 * inv_alpha)) as u8;
+                            frame[dst_offset + 2] = ((self.drawing_layer[src_offset + 2] as f32 * alpha) + (frame[dst_offset + 2] as f32 * inv_alpha)) as u8;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1649,8 +1694,11 @@ impl ApplicationHandler for App {
                         Ok(viewport_data) => {
                             frame.copy_from_slice(&viewport_data);
                             
-                            // Render posters on top of board but below UI
+                            // Render posters on top of board background
                             self.rickboard.render_posters(frame, self.render_width, self.render_height);
+                            
+                            // Render drawing layer on top of posters
+                            self.rickboard.board.render_drawing_layer(frame, self.render_width, self.render_height);
                             
                             // Render UI overlay on top
                             self.rickboard.render_ui_overlay(frame, self.render_width, self.render_height, self.fps);
