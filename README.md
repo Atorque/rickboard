@@ -197,8 +197,8 @@ All drawings are automatically saved to `rickboard.data` in the application dire
 
 ## License
 
-[Specify your license here]
+CHECK LICENSE.MD
 
 ## Author
 
-[Your name/info here]
+ATORQUE
