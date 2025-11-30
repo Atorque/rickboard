@@ -1,0 +1,10 @@
+[package]
+name = "rickboard"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winit = "0.30"
+pixels = "0.15"
+rayon = "1.10"
+image = "0.25"

@@ -1,0 +1,1253 @@
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write, Seek, SeekFrom};
+use std::path::Path;
+use std::rc::Rc;
+use std::time::Instant;
+
+// File format: 9-byte header + pixel data
+// Header: [mode: u8, width: u32 (LE), height: u32 (LE)]
+const HEADER_SIZE: u64 = 9;
+use rayon::prelude::*;
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey, ModifiersState};
+use winit::window::{Window, WindowId};
+use pixels::{Pixels, SurfaceTexture};
+use image::GenericImageView;
+
+/// Represents a point on the board
+#[derive(Debug, Clone, Copy)]
+pub struct Point {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Board mode - blackboard (dark) or whiteboard (light)
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BoardMode {
+    Blackboard,
+    Whiteboard,
+}
+
+impl BoardMode {
+    fn background_color(&self) -> [u8; 4] {
+        match self {
+            BoardMode::Blackboard => [15, 15, 15, 255],  // Dark grey
+            BoardMode::Whiteboard => [255, 255, 255, 255], // Pure white
+        }
+    }
+
+    fn default_pen_color(&self) -> [u8; 4] {
+        match self {
+            BoardMode::Blackboard => [255, 255, 255, 255], // White chalk
+            BoardMode::Whiteboard => [0, 0, 0, 255],    // Black marker (inverts perfectly with white)
+        }
+    }
+}
+
+/// Represents the board configuration
+#[derive(Debug)]
+struct BoardConfig {
+    width: u32,
+    height: u32,
+    pixel_size: usize,
+    mode: BoardMode,
+}
+
+/// Main board structure with cylindrical topology
+struct Board {
+    config: BoardConfig,
+    data_file: File,
+    pub viewport: Viewport,
+    cache: Vec<u8>,  // In-memory cache of entire board for fast rendering
+    undo_stack: Vec<Vec<u8>>,  // Store up to 3 previous board states
+}
+
+/// Camera/viewport for navigation
+pub struct Viewport {
+    pub position: Point,
+    pub zoom: f32,
+}
+
+impl Board {
+    /// Create a new board with specified dimensions
+    fn new(width: u32, height: u32, mode: BoardMode, file_path: &Path) -> io::Result<Self> {
+        let file_exists = file_path.exists();
+        
+        // Check if existing file has valid header
+        let has_valid_header = if file_exists {
+            if let Ok(metadata) = std::fs::metadata(file_path) {
+                metadata.len() > HEADER_SIZE
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        
+        let mut data_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(file_path)?;
+
+        let (loaded_mode, loaded_width, loaded_height) = if has_valid_header {
+            // Read header to get saved mode and dimensions
+            let mut header = [0u8; HEADER_SIZE as usize];
+            if let Ok(_) = data_file.read_exact(&mut header) {
+                let saved_mode = match header[0] {
+                    0 => BoardMode::Blackboard,
+                    1 => BoardMode::Whiteboard,
+                    _ => mode,
+                };
+                let saved_width = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
+                let saved_height = u32::from_le_bytes([header[5], header[6], header[7], header[8]]);
+                
+                // Validate dimensions
+                if saved_width > 0 && saved_height > 0 && saved_width <= 100000 && saved_height <= 100000 {
+                    println!("Loading existing board: {}x{} ({:?} mode)", saved_width, saved_height, saved_mode);
+                    (saved_mode, saved_width, saved_height)
+                } else {
+                    // Invalid dimensions, use defaults
+                    println!("Invalid saved dimensions, creating new board");
+                    (mode, width, height)
+                }
+            } else {
+                // Can't read header, use defaults
+                println!("Cannot read header, creating new board");
+                (mode, width, height)
+            }
+        } else {
+            // No valid header, create new board
+            if file_exists {
+                println!("Old format detected, creating new board (old data will be overwritten)");
+            }
+            (mode, width, height)
+        };
+
+        let config = BoardConfig {
+            width: loaded_width,
+            height: loaded_height,
+            pixel_size: 4, // RGBA
+            mode: loaded_mode,
+        };
+
+        // Pre-allocate disk space
+        let total_size = HEADER_SIZE + (loaded_width as u64) * (loaded_height as u64) * (config.pixel_size as u64);
+        data_file.set_len(total_size)?;
+
+        // Allocate memory cache for entire board
+        let cache_size = (loaded_width as usize) * (loaded_height as usize) * 4;
+        let cache = vec![0u8; cache_size];
+        
+        let mut board = Board {
+            config,
+            data_file,
+            viewport: Viewport {
+                position: Point { x: 0.0, y: 0.0 },
+                zoom: 1.0,
+            },
+            cache,
+            undo_stack: Vec::new(),
+        };
+
+        if has_valid_header {
+            // Load existing data from disk
+            board.load_cache()?;
+        } else {
+            // Initialize new board with background color and write header
+            board.clear()?;
+            board.write_header()?;
+        }
+
+        Ok(board)
+    }
+    
+    /// Write header with mode and dimensions
+    fn write_header(&mut self) -> io::Result<()> {
+        let mut header = [0u8; HEADER_SIZE as usize];
+        header[0] = match self.config.mode {
+            BoardMode::Blackboard => 0,
+            BoardMode::Whiteboard => 1,
+        };
+        header[1..5].copy_from_slice(&self.config.width.to_le_bytes());
+        header[5..9].copy_from_slice(&self.config.height.to_le_bytes());
+        
+        self.data_file.seek(SeekFrom::Start(0))?;
+        self.data_file.write_all(&header)?;
+        Ok(())
+    }
+    
+    /// Load entire board from disk into memory cache
+    fn load_cache(&mut self) -> io::Result<()> {
+        self.data_file.seek(SeekFrom::Start(HEADER_SIZE))?;
+        self.data_file.read_exact(&mut self.cache)?;
+        Ok(())
+    }
+
+    /// Draw a pixel at the given position (only writes to cache)
+    #[inline(always)]
+    fn draw_pixel(&mut self, x: i32, y: i32, color: [u8; 4]) {
+        // Only wrap horizontally (cylindrical), reject out-of-bounds vertical coords
+        if y < 0 || y >= self.config.height as i32 {
+            return; // Don't draw outside vertical bounds
+        }
+        
+        let wrapped_x = x.rem_euclid(self.config.width as i32) as u32;
+        let y = y as u32;
+
+        let offset = (((y as u64) * (self.config.width as u64) + (wrapped_x as u64)) 
+            * (self.config.pixel_size as u64)) as usize;
+
+        // Write to cache using direct pointer write for maximum speed
+        unsafe {
+            let ptr = self.cache.as_mut_ptr().add(offset) as *mut u32;
+            *ptr = u32::from_ne_bytes(color);
+        }
+    }
+    
+    /// Save current board state to undo stack (keep max 3 states)
+    fn save_undo_state(&mut self) {
+        let snapshot = self.cache.clone();
+        self.undo_stack.push(snapshot);
+        
+        // Keep only last 3 states
+        if self.undo_stack.len() > 3 {
+            self.undo_stack.remove(0);
+        }
+    }
+    
+    /// Undo last operation by restoring previous state
+    fn undo(&mut self) -> bool {
+        if let Some(previous_state) = self.undo_stack.pop() {
+            self.cache = previous_state;
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Sync pending changes to disk (write entire cache)
+    fn sync(&mut self) -> io::Result<()> {
+        self.write_header()?;
+        self.data_file.seek(SeekFrom::Start(HEADER_SIZE))?;
+        self.data_file.write_all(&self.cache)?;
+        self.data_file.sync_data()?;
+        Ok(())
+    }
+    
+    /// Toggle between Blackboard and Whiteboard modes
+    fn toggle_mode(&mut self) -> io::Result<()> {
+        let old_bg = self.config.mode.background_color();
+        
+        self.config.mode = match self.config.mode {
+            BoardMode::Blackboard => BoardMode::Whiteboard,
+            BoardMode::Whiteboard => BoardMode::Blackboard,
+        };
+        
+        let new_bg = self.config.mode.background_color();
+        
+        // Remap colors: swap backgrounds and only invert pure black/white
+        for i in (0..self.cache.len()).step_by(4) {
+            let r = self.cache[i];
+            let g = self.cache[i + 1];
+            let b = self.cache[i + 2];
+            
+            // Check if this pixel is the old background color
+            if r == old_bg[0] && g == old_bg[1] && b == old_bg[2] {
+                // Replace with new background
+                self.cache[i] = new_bg[0];
+                self.cache[i + 1] = new_bg[1];
+                self.cache[i + 2] = new_bg[2];
+            } else if r == 0 && g == 0 && b == 0 {
+                // Pure black -> white
+                self.cache[i] = 255;
+                self.cache[i + 1] = 255;
+                self.cache[i + 2] = 255;
+            } else if r == 255 && g == 255 && b == 255 {
+                // Pure white -> black
+                self.cache[i] = 0;
+                self.cache[i + 1] = 0;
+                self.cache[i + 2] = 0;
+            }
+            // All other colors remain unchanged
+        }
+        
+        self.sync()?;
+        Ok(())
+    }
+    
+    /// Clear the board with background color (optimized bulk write)
+    fn clear(&mut self) -> io::Result<()> {
+        let bg_color = self.config.mode.background_color();
+        
+        println!("Initializing board (this may take a moment)...");
+        
+        // Fill cache with background color
+        for i in (0..self.cache.len()).step_by(4) {
+            self.cache[i..i+4].copy_from_slice(&bg_color);
+        }
+        
+        // Write cache to disk in chunks
+        let chunk_size = 1024 * 256; // 256KB chunks
+        let total_bytes = self.cache.len();
+        let num_chunks = (total_bytes + chunk_size - 1) / chunk_size;
+        
+        self.data_file.seek(SeekFrom::Start(0))?;
+        
+        for i in 0..num_chunks {
+            let start = i * chunk_size;
+            let end = (start + chunk_size).min(total_bytes);
+            self.data_file.write_all(&self.cache[start..end])?;
+            
+            let progress = ((i + 1) * 100 / num_chunks).min(100);
+            print!("\\rProgress: {}%", progress);
+            io::stdout().flush()?;
+        }
+        
+        println!(" - Complete!");
+        self.data_file.sync_all()?;
+        Ok(())
+    }
+
+    /// Get the default pen color for the current board mode
+    fn default_pen_color(&self) -> [u8; 4] {
+        self.config.mode.default_pen_color()
+    }
+
+    /// Render the current viewport with optional cylindrical projection
+    /// Optimized with parallel processing for maximum CPU utilization
+    fn render(&mut self, screen_width: u32, screen_height: u32) -> io::Result<Vec<u8>> {
+        let mut framebuffer = vec![0u8; (screen_width * screen_height * 4) as usize];
+        
+        // Starting position for rendering
+        let start_x = self.viewport.position.x as i32;
+        let start_y = self.viewport.position.y as i32;
+        let zoom = self.viewport.zoom;
+        
+        let black = [0u8, 0u8, 0u8, 255u8]; // Black for out-of-bounds areas
+        let width = self.config.width as i32;
+        let height = self.config.height as i32;
+        let cache_ptr = &self.cache;
+        
+        // Parallel row rendering for maximum CPU utilization
+        framebuffer.par_chunks_mut((screen_width * 4) as usize)
+            .enumerate()
+            .for_each(|(screen_y, row)| {
+                // Apply zoom: convert screen coords to board coords
+                let board_y = start_y + ((screen_y as f32) / zoom) as i32;
+                
+                if board_y >= 0 && board_y < height {
+                    let row_start_offset = (board_y as usize) * (width as usize) * 4;
+                    
+                    // Process pixels in this row
+                    for screen_x in 0..screen_width {
+                        let board_x = start_x + ((screen_x as f32) / zoom) as i32;
+                        let wrapped_x = board_x.rem_euclid(width) as usize;
+                        let src_offset = row_start_offset + (wrapped_x * 4);
+                        let dst_offset = (screen_x * 4) as usize;
+                        row[dst_offset..dst_offset + 4].copy_from_slice(&cache_ptr[src_offset..src_offset + 4]);
+                    }
+                } else {
+                    // Fill with black if out of vertical bounds
+                    for screen_x in 0..screen_width {
+                        let dst_offset = (screen_x * 4) as usize;
+                        row[dst_offset..dst_offset + 4].copy_from_slice(&black);
+                    }
+                }
+            });
+
+        Ok(framebuffer)
+    }
+}
+
+/// Color marker data
+struct ColorMarker {
+    color: [u8; 4],
+    open_image: Vec<u8>,   // RGBA data
+    closed_image: Vec<u8>, // RGBA data
+    width: u32,
+    height: u32,
+}
+
+/// Drawing tool state
+struct DrawingTool {
+    current_color: [u8; 4],
+    brush_size: u32,
+    is_drawing: bool,
+    is_eraser: bool, // True when using eraser (right mouse)
+    last_point: Option<Point>,
+    selected_marker_index: usize,
+}
+
+/// Main application state
+struct RickBoard {
+    board: Board,
+    drawing_tool: DrawingTool,
+    markers: Vec<ColorMarker>,
+}
+
+impl RickBoard {
+    fn load_marker_image(path: &str) -> io::Result<(Vec<u8>, u32, u32)> {
+        let img = image::open(path)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let (width, height) = img.dimensions();
+        let rgba = img.to_rgba8();
+        Ok((rgba.into_raw(), width, height))
+    }
+    
+    fn new(width: u32, height: u32, mode: BoardMode, file_path: &Path) -> io::Result<Self> {
+        let board = Board::new(width, height, mode, file_path)?;
+        let default_color = board.default_pen_color();
+        
+        // Load color markers
+        let marker_colors = vec![
+            ("black", [0, 0, 0, 255]),
+            ("white", [255, 255, 255, 255]),
+            ("red", [255, 0, 0, 255]),
+            ("blue", [30, 144, 255, 255]),      // Dodger blue
+            ("green", [0, 255, 0, 255]),
+            ("yellow", [255, 255, 0, 255]),
+            ("pink", [255, 0, 255, 255]),       // Magenta
+        ];
+        
+        let mut markers = Vec::new();
+        for (name, color) in marker_colors {
+            let open_path = format!("assetts/{}_marker_open.png", name);
+            let closed_path = format!("assetts/{}_marker_closed.png", name);
+            
+            if let (Ok((open_data, w1, h1)), Ok((closed_data, _w2, _h2))) = 
+                (Self::load_marker_image(&open_path), Self::load_marker_image(&closed_path)) {
+                markers.push(ColorMarker {
+                    color,
+                    open_image: open_data,
+                    closed_image: closed_data,
+                    width: w1,
+                    height: h1,
+                });
+            }
+        }
+        
+        // Find index of default color marker
+        let selected_index = markers.iter()
+            .position(|m| m.color == default_color)
+            .unwrap_or(0);
+        
+        Ok(RickBoard {
+            board,
+            drawing_tool: DrawingTool {
+                current_color: default_color,
+                brush_size: 2,
+                is_drawing: false,
+                is_eraser: false,
+                last_point: None,
+                selected_marker_index: selected_index,
+            },
+            markers,
+        })
+    }
+
+    fn start_drawing(&mut self, point: Point, is_eraser: bool) {
+        // Save undo state before starting new drawing operation
+        self.board.save_undo_state();
+        
+        self.drawing_tool.is_drawing = true;
+        self.drawing_tool.is_eraser = is_eraser;
+        self.drawing_tool.last_point = Some(point);
+        // Draw initial pixel with brush size
+        let _ = self.draw_brush(point);
+    }
+
+    fn continue_drawing(&mut self, point: Point) {
+        if self.drawing_tool.is_drawing {
+            // Draw line from last point to current point for solid strokes
+            if let Some(last_point) = self.drawing_tool.last_point {
+                // Calculate distance and interpolate to connect points
+                let dx = point.x - last_point.x;
+                let dy = point.y - last_point.y;
+                let distance = (dx * dx + dy * dy).sqrt();
+                let steps = distance.ceil().max(1.0) as i32;
+                
+                // Draw brushes along the line
+                for i in 0..=steps {
+                    let t = i as f32 / steps as f32;
+                    let interp_point = Point {
+                        x: last_point.x + dx * t,
+                        y: last_point.y + dy * t,
+                    };
+                    self.draw_brush(interp_point);
+                }
+            } else {
+                self.draw_brush(point);
+            }
+            self.drawing_tool.last_point = Some(point);
+        }
+    }
+    
+    fn draw_brush(&mut self, center: Point) {
+        let radius = (self.drawing_tool.brush_size / 2) as i32;
+        let cx = center.x as i32;
+        let cy = center.y as i32;
+        
+        // Use background color for eraser, current color for drawing
+        let color = if self.drawing_tool.is_eraser {
+            self.board.config.mode.background_color()
+        } else {
+            self.drawing_tool.current_color
+        };
+        
+        // Direct pixel writes without allocation
+        for dy in -radius..=radius {
+            let dy2 = dy * dy;
+            for dx in -radius..=radius {
+                if dx * dx + dy2 <= radius * radius {
+                    self.board.draw_pixel(cx + dx, cy + dy, color);
+                }
+            }
+        }
+    }
+
+    fn stop_drawing(&mut self) {
+        self.drawing_tool.is_drawing = false;
+        self.drawing_tool.last_point = None;
+        // Don't sync on every mouse release - too slow for large boards
+        // Data is safely in cache and will sync on mode toggle or app close
+    }
+
+    fn clear_board(&mut self) -> io::Result<()> {
+        self.board.clear()?;
+        self.board.sync()?;
+        Ok(())
+    }
+    
+    /// Toggle between Blackboard and Whiteboard modes
+    fn toggle_mode(&mut self) -> io::Result<()> {
+        // If currently using white pen (index 1), switch to black (index 0)
+        // If currently using black pen (index 0), switch to white (index 1)
+        if self.drawing_tool.selected_marker_index == 1 {
+            self.drawing_tool.selected_marker_index = 0;
+            self.drawing_tool.current_color = self.markers[0].color; // Black
+        } else if self.drawing_tool.selected_marker_index == 0 {
+            self.drawing_tool.selected_marker_index = 1;
+            self.drawing_tool.current_color = self.markers[1].color; // White
+        }
+        
+        self.board.toggle_mode()?;
+        Ok(())
+    }
+    
+    /// Handle click on UI elements, returns true if click was on UI
+    fn handle_ui_click(&mut self, x: f64, y: f64, render_height: u32) -> io::Result<(bool, bool)> {
+        // Returns (clicked_on_ui, mode_was_toggled)
+        
+        // Check if click is on mode toggle button (x:20-135, y:170-190)
+        if x >= 20.0 && x <= 135.0 && y >= 170.0 && y <= 190.0 {
+            self.toggle_mode()?;
+            return Ok((true, true));
+        }
+        
+        // Check if click is on slider (x:20-160, y:150-165)
+        if x >= 20.0 && x <= 160.0 && y >= 150.0 && y <= 165.0 {
+            // Calculate brush size from x position
+            let slider_x = (x - 20.0).max(0.0).min(140.0);
+            self.drawing_tool.brush_size = ((slider_x / 140.0) * 100.0).round() as u32;
+            self.drawing_tool.brush_size = self.drawing_tool.brush_size.max(1).min(100);
+            return Ok((true, false));
+        }
+        
+        // Check if click is on color markers (bottom-left corner)
+        let marker_spacing = 5.0;
+        let bottom_margin = -10.0;
+        let scale = 0.5; // 50% scale
+        
+        for (i, marker) in self.markers.iter().enumerate() {
+            // Skip black marker in blackboard mode (index 0)
+            if self.board.config.mode == BoardMode::Blackboard && i == 0 {
+                continue;
+            }
+            // Skip white marker in whiteboard mode (index 1)
+            if self.board.config.mode == BoardMode::Whiteboard && i == 1 {
+                continue;
+            }
+            
+            let scaled_width = marker.width as f64 * scale;
+            let scaled_height = marker.height as f64 * scale;
+            
+            let x_pos = marker_spacing + (i as f64) * (scaled_width + marker_spacing);
+            let y_pos = render_height as f64 - scaled_height - bottom_margin;
+            
+            if x >= x_pos && x <= x_pos + scaled_width && 
+               y >= y_pos && y <= y_pos + scaled_height {
+                // Marker clicked - update selected marker and current color
+                self.drawing_tool.selected_marker_index = i;
+                self.drawing_tool.current_color = marker.color;
+                return Ok((true, false));
+            }
+        }
+        
+        Ok((false, false))
+    }
+    
+    /// Render UI overlay (legend and brush controls)
+    fn render_ui_overlay(&self, frame: &mut [u8], width: u32, height: u32, fps: f32) {
+        let text_color = match self.board.config.mode {
+            BoardMode::Blackboard => [255u8, 255u8, 255u8, 255u8], // White text
+            BoardMode::Whiteboard => [0u8, 0u8, 0u8, 255u8], // Black text
+        };
+        
+        // Different transparency for different modes
+        let bg_color = match self.board.config.mode {
+            BoardMode::Blackboard => [0u8, 0u8, 0u8, 128u8], // 50% transparent black
+            BoardMode::Whiteboard => [255u8, 255u8, 255u8, 153u8], // 60% transparent white
+        };
+        
+        // Draw background panel (top-left, 280x220 pixels)
+        for y in 10..230 {
+            for x in 10..290 {
+                let offset = ((y * width + x) * 4) as usize;
+                if offset + 3 < frame.len() {
+                    // Alpha blend with existing content for transparency
+                    let alpha = bg_color[3] as f32 / 255.0;
+                    let inv_alpha = 1.0 - alpha;
+                    frame[offset] = ((bg_color[0] as f32 * alpha) + (frame[offset] as f32 * inv_alpha)) as u8;
+                    frame[offset + 1] = ((bg_color[1] as f32 * alpha) + (frame[offset + 1] as f32 * inv_alpha)) as u8;
+                    frame[offset + 2] = ((bg_color[2] as f32 * alpha) + (frame[offset + 2] as f32 * inv_alpha)) as u8;
+                    frame[offset + 3] = 255; // Keep fully opaque
+                }
+            }
+        }
+        
+        // Render text legend (simplified - just draw simple characters)
+        self.draw_simple_text(frame, width, 20, 20, "CONTROLS:", text_color);
+        self.draw_simple_text(frame, width, 20, 35, "Left Click: Draw", text_color);
+        self.draw_simple_text(frame, width, 20, 48, "Right Click: Erase", text_color);
+        self.draw_simple_text(frame, width, 20, 61, "WASD: Pan", text_color);
+        self.draw_simple_text(frame, width, 20, 74, "Mouse Wheel: Zoom", text_color);
+        self.draw_simple_text(frame, width, 20, 87, "+/- Keys: Brush Size", text_color);
+        self.draw_simple_text(frame, width, 20, 100, "C Key: Clear Board", text_color);
+        self.draw_simple_text(frame, width, 20, 113, "P Key: Save", text_color);
+        self.draw_simple_text(frame, width, 20, 126, "ESC: Exit", text_color);
+        
+        // Draw FPS in top-right corner of legend panel
+        let fps_text = format!("FPS: {:.1}", fps);
+        self.draw_simple_text(frame, width, 210, 20, &fps_text, text_color);
+        
+        // Draw brush size slider
+        self.draw_simple_text(frame, width, 20, 135, &format!("Brush: {}", self.drawing_tool.brush_size), text_color);
+        
+        // Draw slider bar (140 pixels wide)
+        for x in 20..160 {
+            for dy in 0..3 {
+                let offset = (((155 + dy) * width + x) * 4) as usize;
+                if offset + 3 < frame.len() {
+                    frame[offset..offset + 4].copy_from_slice(&text_color);
+                }
+            }
+        }
+        
+        // Draw slider position indicator
+        let slider_pos = 20 + ((self.drawing_tool.brush_size.min(100) * 140) / 100) as u32;
+        for dy in -5..=5 {
+            for dx in -2..=2 {
+                let py = 156 + dy;
+                let px = slider_pos as i32 + dx;
+                if px >= 0 && py >= 0 {
+                    let offset = ((py as u32 * width + px as u32) * 4) as usize;
+                    if offset + 3 < frame.len() {
+                        frame[offset..offset + 4].copy_from_slice(&[255, 100, 100, 255]);
+                    }
+                }
+            }
+        }
+        
+        // Draw brush preview circle
+        let preview_x = 210;
+        let preview_y = 86;
+        let radius = (self.drawing_tool.brush_size / 2).min(50) as i32;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx * dx + dy * dy <= radius * radius {
+                    let px = preview_x + dx;
+                    let py = preview_y + dy;
+                    if px >= 0 && py >= 0 {
+                        let offset = ((py as u32 * width + px as u32) * 4) as usize;
+                        if offset + 3 < frame.len() {
+                            frame[offset..offset + 4].copy_from_slice(&text_color);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Draw mode toggle button
+        let button_text = match self.board.config.mode {
+            BoardMode::Blackboard => "Mode: Blackboard",
+            BoardMode::Whiteboard => "Mode: Whiteboard",
+        };
+        self.draw_simple_text(frame, width, 30, 175, button_text, text_color);
+        
+        // Draw button border (clickable area: x:20-135, y:170-190)
+        for x in 20..135 {
+            for y in [170, 189].iter() {
+                let offset = ((*y * width + x) * 4) as usize;
+                if offset + 3 < frame.len() {
+                    frame[offset..offset + 4].copy_from_slice(&text_color);
+                }
+            }
+        }
+        for y in 170..190 {
+            for x in [20, 134].iter() {
+                let offset = ((y * width + *x) * 4) as usize;
+                if offset + 3 < frame.len() {
+                    frame[offset..offset + 4].copy_from_slice(&text_color);
+                }
+            }
+        }
+        
+        // Render color markers at bottom-left corner
+        self.render_markers(frame, width, height);
+    }
+    
+    /// Render save progress bar at top center
+    fn render_save_progress(&self, frame: &mut [u8], width: u32, time_until_save: f32, is_saving: bool) {
+        let bar_width = 200u32;
+        let bar_height = 6u32;
+        let bar_x = (width / 2) - (bar_width / 2);
+        let bar_y = 10u32;
+        
+        let text_color = match self.board.config.mode {
+            BoardMode::Blackboard => [220, 220, 220, 255],
+            BoardMode::Whiteboard => [40, 40, 40, 255],
+        };
+        
+        let bg_color = match self.board.config.mode {
+            BoardMode::Blackboard => [0u8, 0u8, 0u8, 128u8], // 50% transparent black
+            BoardMode::Whiteboard => [255u8, 255u8, 255u8, 153u8], // 60% transparent white
+        };
+        
+        // Draw progress bar background (empty)
+        for y in bar_y..bar_y + bar_height {
+            for x in bar_x..bar_x + bar_width {
+                let offset = ((y * width + x) * 4) as usize;
+                if offset + 3 < frame.len() {
+                    frame[offset] = text_color[0] / 3;
+                    frame[offset + 1] = text_color[1] / 3;
+                    frame[offset + 2] = text_color[2] / 3;
+                    frame[offset + 3] = 255;
+                }
+            }
+        }
+        
+        // Draw progress bar fill (elapsed time)
+        let progress = (60.0 - time_until_save) / 60.0; // 60 seconds = 1 minute
+        let fill_width = (bar_width as f32 * progress) as u32;
+        for y in bar_y..bar_y + bar_height {
+            for x in bar_x..bar_x + fill_width {
+                let offset = ((y * width + x) * 4) as usize;
+                if offset + 3 < frame.len() {
+                    frame[offset..offset + 4].copy_from_slice(&text_color);
+                }
+            }
+        }
+        
+        // Show "Saving..." message under progress bar when saving
+        if is_saving {
+            let msg_y = bar_y + bar_height + 5; // 5 pixels below progress bar
+            let msg_width = 80u32;
+            let msg_height = 15u32;
+            let msg_x = bar_x + (bar_width / 2) - (msg_width / 2);
+            
+            // Draw background panel for message
+            for y in msg_y..msg_y + msg_height {
+                for x in msg_x..msg_x + msg_width {
+                    let offset = ((y * width + x) * 4) as usize;
+                    if offset + 3 < frame.len() {
+                        // Alpha blend with existing content for transparency
+                        let alpha = bg_color[3] as f32 / 255.0;
+                        let inv_alpha = 1.0 - alpha;
+                        frame[offset] = ((bg_color[0] as f32 * alpha) + (frame[offset] as f32 * inv_alpha)) as u8;
+                        frame[offset + 1] = ((bg_color[1] as f32 * alpha) + (frame[offset + 1] as f32 * inv_alpha)) as u8;
+                        frame[offset + 2] = ((bg_color[2] as f32 * alpha) + (frame[offset + 2] as f32 * inv_alpha)) as u8;
+                        frame[offset + 3] = 255;
+                    }
+                }
+            }
+            
+            // Draw "Saving..." text centered
+            self.draw_simple_text(frame, width, msg_x + 8, msg_y + 3, "Saving...", text_color);
+        }
+    }
+    
+    /// Render color markers at bottom-left
+    fn render_markers(&self, frame: &mut [u8], width: u32, height: u32) {
+        let marker_spacing = 5u32; // 5 pixels between markers
+        let bottom_margin = -10i32; // Negative to extend below bottom edge
+        let scale = 0.5; // 50% scale
+        
+        for (i, marker) in self.markers.iter().enumerate() {
+            let is_selected = i == self.drawing_tool.selected_marker_index;
+            let image_data = if is_selected { &marker.open_image } else { &marker.closed_image };
+            
+            let scaled_width = (marker.width as f32 * scale) as u32;
+            let scaled_height = (marker.height as f32 * scale) as u32;
+            
+            // Calculate position (bottom-left corner, arranged in a row)
+            let x_pos = marker_spacing + (i as u32) * (scaled_width + marker_spacing);
+            let y_pos = (height as i32 - scaled_height as i32 - bottom_margin) as u32;
+            
+            // Render marker image with scaling
+            for sy in 0..scaled_height {
+                for sx in 0..scaled_width {
+                    // Map scaled coordinates back to original image
+                    let mx = (sx as f32 / scale) as u32;
+                    let my = (sy as f32 / scale) as u32;
+                    
+                    let img_offset = ((my * marker.width + mx) * 4) as usize;
+                    let screen_x = x_pos + sx;
+                    let screen_y = y_pos + sy;
+                    
+                    if screen_x < width && screen_y < height && img_offset + 3 < image_data.len() {
+                        let frame_offset = ((screen_y * width + screen_x) * 4) as usize;
+                        if frame_offset + 3 < frame.len() {
+                            let alpha = image_data[img_offset + 3] as f32 / 255.0;
+                            if alpha > 0.0 {
+                                let inv_alpha = 1.0 - alpha;
+                                frame[frame_offset] = ((image_data[img_offset] as f32 * alpha) + (frame[frame_offset] as f32 * inv_alpha)) as u8;
+                                frame[frame_offset + 1] = ((image_data[img_offset + 1] as f32 * alpha) + (frame[frame_offset + 1] as f32 * inv_alpha)) as u8;
+                                frame[frame_offset + 2] = ((image_data[img_offset + 2] as f32 * alpha) + (frame[frame_offset + 2] as f32 * inv_alpha)) as u8;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Draw simple text (basic bitmap font)
+    fn draw_simple_text(&self, frame: &mut [u8], width: u32, x: u32, y: u32, text: &str, color: [u8; 4]) {
+        for (i, ch) in text.chars().enumerate() {
+            let char_x = x + (i as u32 * 6);
+            self.draw_char(frame, width, char_x, y, ch, color);
+        }
+    }
+    
+    /// Draw a single character (very simple 5x7 bitmap)
+    fn draw_char(&self, frame: &mut [u8], width: u32, x: u32, y: u32, ch: char, color: [u8; 4]) {
+        // Simple pixel patterns for basic characters
+        let pattern: &[u8] = match ch {
+            'A' | 'a' => &[0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+            'B' | 'b' => &[0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+            'C' | 'c' => &[0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
+            'D' | 'd' => &[0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
+            'E' | 'e' => &[0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+            'F' | 'f' => &[0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
+            'G' | 'g' => &[0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
+            'H' | 'h' => &[0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+            'I' | 'i' => &[0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+            'K' | 'k' => &[0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
+            'L' | 'l' => &[0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
+            'M' | 'm' => &[0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
+            'N' | 'n' => &[0b10001, 0b11001, 0b10101, 0b10101, 0b10011, 0b10001, 0b10001],
+            'O' | 'o' => &[0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+            'P' | 'p' => &[0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+            'R' | 'r' => &[0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
+            'S' | 's' => &[0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+            'T' | 't' => &[0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+            'U' | 'u' => &[0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+            'W' | 'w' => &[0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
+            'X' | 'x' => &[0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
+            'Y' | 'y' => &[0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
+            'Z' | 'z' => &[0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
+            '0' => &[0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+            '1' => &[0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+            '2' => &[0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
+            '3' => &[0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110],
+            '4' => &[0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+            '5' => &[0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+            '6' => &[0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+            '7' => &[0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+            '8' => &[0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+            '9' => &[0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+            ':' => &[0b00000, 0b00100, 0b00000, 0b00000, 0b00000, 0b00100, 0b00000],
+            '+' => &[0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000],
+            '-' | '/' => &[0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
+            ' ' => &[0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000],
+            _ => &[0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111],
+        };
+        
+        for (row, &bits) in pattern.iter().enumerate() {
+            for col in 0..5 {
+                if (bits >> (4 - col)) & 1 == 1 {
+                    let px = x + col;
+                    let py = y + row as u32;
+                    let offset = ((py * width + px) * 4) as usize;
+                    if offset + 3 < frame.len() {
+                        frame[offset..offset + 4].copy_from_slice(&color);
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct App {
+    window: Option<Rc<Window>>,
+    pixels: Option<Pixels<'static>>,
+    rickboard: RickBoard,
+    mouse_down: bool,
+    right_mouse_down: bool, // Track right mouse button for eraser
+    cursor_pos: (f64, f64), // Track cursor position for zoom
+    render_width: u32,
+    render_height: u32,
+    frame_count: u32,
+    last_fps_update: Instant,
+    fps: f32,
+    last_save: Instant,
+    is_saving: bool,
+    has_unsaved_changes: bool,
+    modifiers: ModifiersState,
+    save_message_until: Option<Instant>, // Show saving message until this time
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {        if self.pixels.is_none() {
+            let window_attrs = Window::default_attributes()
+                .with_title("RickBoard - Virtual Blackboard/Whiteboard")
+                .with_inner_size(winit::dpi::LogicalSize::new(1024u32, 768u32));
+            
+            let window = Rc::new(event_loop.create_window(window_attrs).unwrap());
+            let window_size = window.inner_size();
+            
+            // Leak an Rc clone to create a 'static reference for Pixels
+            let window_clone = Rc::clone(&window);
+            let window_ref: &'static Window = unsafe { &*(Rc::into_raw(window_clone) as *const Window) };
+            let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, window_ref);
+            let pixels = Pixels::new(window_size.width, window_size.height, surface_texture).unwrap();
+            
+            self.render_width = window_size.width;
+            self.render_height = window_size.height;
+            
+            self.window = Some(window);
+            self.pixels = Some(pixels);
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => {
+                println!("Closing RickBoard...");
+                let _ = self.rickboard.board.sync();
+                event_loop.exit();
+            }
+            
+            WindowEvent::Resized(new_size) => {
+                if let Some(pixels) = &mut self.pixels {
+                    if let Err(e) = pixels.resize_surface(new_size.width, new_size.height) {
+                        eprintln!("Failed to resize surface: {}", e);
+                    }
+                    if let Err(e) = pixels.resize_buffer(new_size.width, new_size.height) {
+                        eprintln!("Failed to resize buffer: {}", e);
+                    }
+                    self.render_width = new_size.width;
+                    self.render_height = new_size.height;
+                }
+            }
+            
+            WindowEvent::ModifiersChanged(new_modifiers) => {
+                self.modifiers = new_modifiers.state();
+            }
+            
+            WindowEvent::MouseInput { state, button, .. } => {
+                match button {
+                    MouseButton::Left => {
+                        match state {
+                            ElementState::Pressed => {
+                                // Check if click is on UI first
+                                if let Ok((on_ui, mode_toggled)) = self.rickboard.handle_ui_click(self.cursor_pos.0, self.cursor_pos.1, self.render_height) {
+                                    if mode_toggled {
+                                        self.has_unsaved_changes = true;
+                                    }
+                                    if !on_ui {
+                                        self.mouse_down = true;
+                                    }
+                                    if let Some(window) = &self.window {
+                                        window.request_redraw();
+                                    }
+                                }
+                            }
+                            ElementState::Released => {
+                                self.mouse_down = false;
+                                self.rickboard.stop_drawing();
+                            }
+                        }
+                    }
+                    MouseButton::Right => {
+                        match state {
+                            ElementState::Pressed => {
+                                self.right_mouse_down = true;
+                            }
+                            ElementState::Released => {
+                                self.right_mouse_down = false;
+                                self.rickboard.stop_drawing();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = (position.x, position.y);
+                
+                // Handle slider dragging
+                if self.mouse_down && position.x >= 20.0 && position.x <= 160.0 && position.y >= 150.0 && position.y <= 165.0 {
+                    let _ = self.rickboard.handle_ui_click(position.x, position.y, self.render_height);
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return; // Don't draw on board while dragging slider
+                }
+                
+                if self.mouse_down || self.right_mouse_down {
+                    // Convert screen coordinates to board coordinates with proper zoom handling
+                    let board_x = self.rickboard.board.viewport.position.x + (position.x as f32 / self.rickboard.board.viewport.zoom);
+                    let board_y = self.rickboard.board.viewport.position.y + (position.y as f32 / self.rickboard.board.viewport.zoom);
+                    let is_eraser = self.right_mouse_down;
+                    
+                    if !self.rickboard.drawing_tool.is_drawing {
+                        self.rickboard.start_drawing(Point { x: board_x, y: board_y }, is_eraser);
+                    } else {
+                        self.rickboard.continue_drawing(Point { x: board_x, y: board_y });
+                    }
+                    self.has_unsaved_changes = true;
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+            
+            WindowEvent::MouseWheel { delta, .. } => {
+                let zoom_factor = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => {
+                        if y > 0.0 { 1.1 } else { 0.9 }
+                    }
+                    MouseScrollDelta::PixelDelta(pos) => {
+                        if pos.y > 0.0 { 1.1 } else { 0.9 }
+                    }
+                };
+                
+                // Calculate board position at cursor before zoom
+                let cursor_board_x = self.rickboard.board.viewport.position.x + (self.cursor_pos.0 as f32 / self.rickboard.board.viewport.zoom);
+                let cursor_board_y = self.rickboard.board.viewport.position.y + (self.cursor_pos.1 as f32 / self.rickboard.board.viewport.zoom);
+                
+                // Apply zoom
+                self.rickboard.board.viewport.zoom *= zoom_factor;
+                
+                // Adjust viewport position to keep cursor at same board position
+                self.rickboard.board.viewport.position.x = cursor_board_x - (self.cursor_pos.0 as f32 / self.rickboard.board.viewport.zoom);
+                self.rickboard.board.viewport.position.y = cursor_board_y - (self.cursor_pos.1 as f32 / self.rickboard.board.viewport.zoom);
+                
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed {
+                    if let PhysicalKey::Code(keycode) = event.physical_key {
+                        match keycode {
+                            KeyCode::Escape => event_loop.exit(),
+                            KeyCode::KeyW => {
+                                self.rickboard.board.viewport.position.y -= 50.0;
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                            KeyCode::KeyS => {
+                                self.rickboard.board.viewport.position.y += 50.0;
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                            KeyCode::KeyA => {
+                                self.rickboard.board.viewport.position.x -= 50.0;
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                            KeyCode::KeyD => {
+                                self.rickboard.board.viewport.position.x += 50.0;
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                            KeyCode::Equal | KeyCode::NumpadAdd => {
+                                self.rickboard.drawing_tool.brush_size = (self.rickboard.drawing_tool.brush_size + 1).min(100);
+                                println!("Brush size: {}", self.rickboard.drawing_tool.brush_size);
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                            KeyCode::Minus | KeyCode::NumpadSubtract => {
+                                self.rickboard.drawing_tool.brush_size = (self.rickboard.drawing_tool.brush_size.saturating_sub(1)).max(1);
+                                println!("Brush size: {}", self.rickboard.drawing_tool.brush_size);
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                            KeyCode::KeyC => {
+                                if let Err(e) = self.rickboard.clear_board() {
+                                    eprintln!("Clear error: {}", e);
+                                }
+                                self.has_unsaved_changes = true;
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                            KeyCode::KeyP => {
+                                self.is_saving = true;
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                                if let Err(e) = self.rickboard.board.sync() {
+                                    eprintln!("Save error: {}", e);
+                                } else {
+                                    self.has_unsaved_changes = false;
+                                }
+                                self.last_save = Instant::now(); // Reset timer
+                                self.save_message_until = Some(Instant::now() + std::time::Duration::from_millis(500));
+                                self.is_saving = false;
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                            KeyCode::KeyZ => {
+                                // Ctrl+Z for undo
+                                if self.modifiers.control_key() {
+                                    if self.rickboard.board.undo() {
+                                        println!("Undo successful");
+                                        self.has_unsaved_changes = true;
+                                        if let Some(window) = &self.window {
+                                            window.request_redraw();
+                                        }
+                                    } else {
+                                        println!("Nothing to undo");
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            
+            WindowEvent::RedrawRequested => {
+                // Update FPS counter
+                self.frame_count += 1;
+                let elapsed = self.last_fps_update.elapsed();
+                if elapsed.as_secs_f32() >= 1.0 {
+                    self.fps = self.frame_count as f32 / elapsed.as_secs_f32();
+                    self.frame_count = 0;
+                    self.last_fps_update = Instant::now();
+                }
+                
+                // Check for auto-save (every 1 minute, only if changes made)
+                let time_since_save = self.last_save.elapsed().as_secs_f32();
+                if time_since_save >= 60.0 && !self.is_saving && self.has_unsaved_changes {
+                    self.is_saving = true;
+                    if let Err(e) = self.rickboard.board.sync() {
+                        eprintln!("Auto-save error: {}", e);
+                    } else {
+                        self.has_unsaved_changes = false;
+                    }
+                    self.last_save = Instant::now();
+                    self.save_message_until = Some(Instant::now() + std::time::Duration::from_millis(500));
+                    self.is_saving = false;
+                }
+                
+                // Check if save message should still be displayed
+                let show_save_message = if let Some(until) = self.save_message_until {
+                    if Instant::now() < until {
+                        true
+                    } else {
+                        self.save_message_until = None;
+                        false
+                    }
+                } else {
+                    self.is_saving
+                };
+                
+                if let Some(pixels) = &mut self.pixels {
+                    let frame = pixels.frame_mut();
+                    
+                    // Render the board's viewport to the screen
+                    match self.rickboard.board.render(self.render_width, self.render_height) {
+                        Ok(viewport_data) => {
+                            frame.copy_from_slice(&viewport_data);
+                            
+                            // Render UI overlay on top
+                            self.rickboard.render_ui_overlay(frame, self.render_width, self.render_height, self.fps);
+                            
+                            // Render save progress bar
+                            let time_until_save = (60.0 - time_since_save).max(0.0);
+                            self.rickboard.render_save_progress(frame, self.render_width, time_until_save, show_save_message);
+                            
+                            if let Err(e) = pixels.render() {
+                                eprintln!("Render error: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Board render error: {}", e);
+                        }
+                    }
+                }
+                
+                // Request another redraw to update the progress bar
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            
+            _ => {}
+        }
+    }
+}
+
+fn main() {
+    // Default to Blackboard mode (can be changed via UI button)
+    let mode = BoardMode::Blackboard;
+    
+    let board_path = Path::new("rickboard.data");
+    
+    match RickBoard::new(80000, 1000, mode, board_path) {
+        Ok(rickboard) => {
+            let event_loop = EventLoop::new().unwrap();
+            event_loop.set_control_flow(ControlFlow::Wait);
+            
+            let mut app = App {
+                window: None,
+                pixels: None,
+                rickboard,
+                mouse_down: false,
+                right_mouse_down: false,
+                cursor_pos: (0.0, 0.0),
+                render_width: 1024,
+                render_height: 768,
+                frame_count: 0,
+                last_fps_update: Instant::now(),
+                fps: 0.0,
+                last_save: Instant::now(),
+                is_saving: false,
+                has_unsaved_changes: false,
+                modifiers: ModifiersState::empty(),
+                save_message_until: None,
+            };
+            
+            event_loop.run_app(&mut app).unwrap();
+        }
+        Err(e) => {
+            eprintln!("Error creating board: {}", e);
+        }
+    }
+}
